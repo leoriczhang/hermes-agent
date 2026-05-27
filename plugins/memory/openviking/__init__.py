@@ -239,6 +239,11 @@ SEARCH_SCHEMA = {
                 "description": "Viking URI prefix to scope search (e.g. 'viking://resources/docs/').",
             },
             "limit": {"type": "integer", "description": "Max results (default: 10)."},
+            "scope": {
+                "type": "string",
+                "enum": ["all", "private", "shared"],
+                "description": "Search scope: all=both spaces (default), private=personal only, shared=team only.",
+            },
         },
         "required": ["query"],
     },
@@ -247,11 +252,11 @@ SEARCH_SCHEMA = {
 READ_SCHEMA = {
     "name": "viking_read",
     "description": (
-        "Read content at a viking:// URI. Three detail levels:\n"
-        "  abstract — ~100 token summary (L0)\n"
-        "  overview — ~2k token key points (L1)\n"
-        "  full — complete content (L2)\n"
-        "Start with abstract/overview, only use full when you need details."
+        "Read content at a viking:// URI. Three detail levels mapped to memory layers:\n"
+        "  abstract — L0 Context Memory: ~100 token summary for quick reference\n"
+        "  overview — L1 Stable Facts: ~2k token key points for preferences/facts\n"
+        "  full — L2 Deep Knowledge: complete content for SOPs/workflows\n"
+        "Start with abstract (L0) or overview (L1), only use full (L2) when you need details."
     ),
     "parameters": {
         "type": "object",
@@ -306,8 +311,87 @@ REMEMBER_SCHEMA = {
                 "enum": ["preference", "entity", "event", "case", "pattern"],
                 "description": "Memory category (default: auto-detected).",
             },
+            "layer": {
+                "type": "string",
+                "enum": ["auto", "L1", "L2"],
+                "description": (
+                    "Memory layer. L1=stable facts (preferences, environment), "
+                    "L2=deep knowledge (SOPs, workflows). auto=system decides (default)."
+                ),
+            },
+            "verified": {
+                "type": "boolean",
+                "description": (
+                    "Whether this information has been verified. Set true when confirmed "
+                    "by execution, user feedback, or explicit confirmation. Default: false."
+                ),
+            },
+            "verification_type": {
+                "type": "string",
+                "enum": ["execution", "user_feedback", "explicit_confirmation", "auto_extracted"],
+                "description": (
+                    "How this information was verified. execution=confirmed by running code/command, "
+                    "user_feedback=user confirmed it, explicit_confirmation=agent explicitly verified, "
+                    "auto_extracted=extracted from session (default)."
+                ),
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["auto", "private", "shared"],
+                "description": (
+                    "Memory scope. auto=L0/L1→private, L2/L3→shared (default). "
+                    "private=force write to personal space. shared=force write to team space."
+                ),
+            },
         },
         "required": ["content"],
+    },
+}
+
+FORGET_SCHEMA = {
+    "name": "viking_forget",
+    "description": (
+        "Archive or deprioritize a memory. Does NOT delete — moves to archive "
+        "where it can be restored. Use when information is outdated, incorrect, "
+        "or no longer relevant."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "uri": {"type": "string", "description": "viking:// URI of the memory to forget."},
+            "mode": {
+                "type": "string",
+                "enum": ["archive", "deprioritize"],
+                "description": (
+                    "archive: move to _archived/ dir (removes from active search). "
+                    "deprioritize: lower search weight (still searchable but ranked lower)."
+                ),
+            },
+            "reason": {"type": "string", "description": "Why this memory is being forgotten."},
+        },
+        "required": ["uri"],
+    },
+}
+
+FEEDBACK_SCHEMA = {
+    "name": "viking_feedback",
+    "description": (
+        "Provide feedback on a shared memory's usefulness. Records whether a "
+        "skill/SOP/workflow succeeded or failed in practice. The Cluster Curator "
+        "uses this feedback to optimize shared knowledge."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "uri": {"type": "string", "description": "viking:// URI of the memory to provide feedback on."},
+            "outcome": {
+                "type": "string",
+                "enum": ["success", "failure", "partial"],
+                "description": "Whether the memory was helpful.",
+            },
+            "note": {"type": "string", "description": "Explanation of the outcome (e.g., 'worked for Python project')."},
+        },
+        "required": ["uri", "outcome"],
     },
 }
 
@@ -422,6 +506,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
         self._prefetch_thread: Optional[threading.Thread] = None
+        self._shared_client: Optional[_VikingClient] = None
+        self._team_user = "__team__"
+        self._feedback_tracking = False
 
     @property
     def name(self) -> str:
@@ -464,6 +551,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "default": "hermes",
                 "env_var": "OPENVIKING_AGENT",
             },
+            {
+                "key": "team_user",
+                "description": "OpenViking user ID for shared team space (default: __team__)",
+                "default": "__team__",
+                "env_var": "OPENVIKING_TEAM_USER",
+            },
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -487,6 +580,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.warning("httpx not installed — OpenViking plugin disabled")
             self._client = None
 
+        # Shared client for team L2/L3 knowledge
+        self._team_user = os.environ.get("OPENVIKING_TEAM_USER", "__team__")
+        self._feedback_tracking = os.environ.get("OPENVIKING_FEEDBACK_TRACKING", "").lower() in ("1", "true", "yes")
+        try:
+            self._shared_client = _VikingClient(
+                self._endpoint, self._api_key,
+                account=self._account, user=self._team_user, agent=self._agent,
+            )
+            if not self._shared_client.health():
+                logger.warning("OpenViking shared client at %s is not reachable", self._endpoint)
+                self._shared_client = None
+        except Exception:
+            self._shared_client = None
+
         # Register as the last active provider for atexit safety net
         global _last_active_provider
         _last_active_provider = self
@@ -494,28 +601,58 @@ class OpenVikingMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         if not self._client:
             return ""
-        # Provide brief info about the knowledge base
         try:
-            # Check what's in the knowledge base via a root listing
             resp = self._client.get("/api/v1/fs/ls", params={"uri": "viking://"})
             result = resp.get("result", [])
             children = len(result) if isinstance(result, list) else 0
             if children == 0:
                 return ""
+
+            shared_section = ""
+            if self._shared_client:
+                shared_section = (
+                    "\n\n## Shared Team Knowledge\n"
+                    f"Team space available (user: {self._team_user}). "
+                    "L2/L3 memories are automatically written to the shared team space. "
+                    "Use `scope=shared` in viking_remember to force writing to team space, "
+                    "or `scope=private` to keep it personal. "
+                    "Use `scope=shared` in viking_search to search only team knowledge.\n"
+                    "After using a shared memory, provide feedback with `viking_feedback` "
+                    "to help the Cluster Curator optimize shared knowledge quality."
+                )
+
             return (
-                "# OpenViking Knowledge Base\n"
-                f"Active. Endpoint: {self._endpoint}\n"
-                "Use viking_search to find information, viking_read for details "
-                "(abstract/overview/full), viking_browse to explore.\n"
-                "Use viking_remember to store facts, viking_add_resource to index URLs/docs."
+                "# OpenViking Knowledge Base (Layered Memory)\n"
+                f"Active. Endpoint: {self._endpoint}\n\n"
+                "## Memory Layers\n"
+                "- **L0 Context Memory** [PRIVATE] (~100 tokens): Auto-injected each turn via prefetch. "
+                "Quick abstracts of relevant knowledge. Use `viking_read level=abstract`.\n"
+                "- **L1 Stable Facts** [PRIVATE] (~2k tokens): User preferences, environment info, project facts. "
+                "Use `viking_read level=overview`.\n"
+                "- **L2 Deep Knowledge** [SHARED] (full): SOPs, workflows, technical detail, code patterns. "
+                "Use `viking_read level=full`.\n"
+                "- **L3 Session Archive** [SHARED]: Cross-session search. Sessions auto-commit on exit, "
+                "extracting memories into 6 categories (profile, preferences, entities, events, cases, patterns).\n\n"
+                "## Tools\n"
+                "- `viking_search` — Semantic search across all layers (supports scope: all/private/shared)\n"
+                "- `viking_read` — Read at a URI with layer-aware detail levels\n"
+                "- `viking_browse` — Filesystem-style navigation\n"
+                "- `viking_remember` — Store a fact (specify layer: L1 for stable facts, L2 for deep knowledge; "
+                "scope: auto/private/shared)\n"
+                "- `viking_forget` — Archive or deprioritize a memory\n"
+                "- `viking_feedback` — Provide feedback on a shared memory's usefulness (success/failure/partial)\n"
+                "- `viking_add_resource` — Ingest URLs/docs into the knowledge base"
+                + shared_section
             )
         except Exception as e:
             logger.warning("OpenViking system_prompt_block failed: %s", e)
+            tools_list = "viking_search, viking_read, viking_browse, viking_remember, viking_forget, viking_feedback, viking_add_resource"
             return (
-                "# OpenViking Knowledge Base\n"
+                "# OpenViking Knowledge Base (Layered Memory)\n"
                 f"Active. Endpoint: {self._endpoint}\n"
-                "Use viking_search, viking_read, viking_browse, "
-                "viking_remember, viking_add_resource."
+                "L0 [PRIVATE]: abstract | L1 [PRIVATE]: overview (stable facts) | "
+                "L2 [SHARED]: full (deep knowledge) | L3 [SHARED]: session archive.\n"
+                f"Use {tools_list}."
             )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
@@ -530,7 +667,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return f"## OpenViking Context\n{result}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Fire a background search to pre-load relevant context."""
+        """Fire a background search to pre-load L0+L1 context."""
         if not self._client or not query:
             return
 
@@ -545,7 +682,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "top_k": 5,
                 })
                 result = resp.get("result", {})
-                parts = []
+                l0_parts = []
+                top_uri = ""
                 for ctx_type in ("memories", "resources"):
                     items = result.get(ctx_type, [])
                     for item in items[:3]:
@@ -553,7 +691,27 @@ class OpenVikingMemoryProvider(MemoryProvider):
                         abstract = item.get("abstract", "")
                         score = item.get("score", 0)
                         if abstract:
-                            parts.append(f"- [{score:.2f}] {abstract} ({uri})")
+                            l0_parts.append(f"- [L0 {score:.2f}] {abstract} ({uri})")
+                        if not top_uri and uri:
+                            top_uri = uri
+                l1_text = ""
+                if top_uri:
+                    try:
+                        ov_resp = client.get("/api/v1/content/overview", params={"uri": top_uri})
+                        ov_result = self._unwrap_result(ov_resp)
+                        if isinstance(ov_result, str):
+                            l1_text = ov_result[:2000]
+                        elif isinstance(ov_result, dict):
+                            l1_text = (ov_result.get("content", "") or ov_result.get("text", ""))[:2000]
+                    except Exception:
+                        pass
+                parts = []
+                if l0_parts:
+                    parts.append("### L0 Context Memory (abstracts)")
+                    parts.extend(l0_parts)
+                if l1_text:
+                    parts.append(f"### L1 Stable Facts (overview of top match: {top_uri})")
+                    parts.append(l1_text)
                 if parts:
                     with self._prefetch_lock:
                         self._prefetch_result = "\n".join(parts)
@@ -626,10 +784,35 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("OpenViking session commit failed: %s", e)
 
-    def _build_memory_uri(self, subdir: str) -> str:
-        """Build a viking:// memory URI under the configured user/subdir."""
+        # Commit shared session (if shared client exists)
+        if self._shared_client:
+            try:
+                shared_session_id = f"{self._session_id}_shared"
+                self._shared_client.post(f"/api/v1/sessions/{shared_session_id}/commit")
+                logger.info("OpenViking shared session %s committed", shared_session_id)
+            except Exception as e:
+                logger.debug("OpenViking shared session commit failed: %s", e)
+
+    def _build_memory_uri(self, subdir: str, scope: str = "private") -> str:
+        """Build a viking:// memory URI under the appropriate user/subdir.
+        scope: "private" uses personal user, "shared" uses team user.
+        """
         slug = uuid.uuid4().hex[:12]
-        return f"viking://user/{self._user}/memories/{subdir}/mem_{slug}.md"
+        user = self._team_user if scope == "shared" else self._user
+        return f"viking://user/{user}/memories/{subdir}/mem_{slug}.md"
+
+    def _client_for_scope(self, scope: str) -> Optional[_VikingClient]:
+        """Return the appropriate client for the given scope."""
+        if scope == "shared" and self._shared_client:
+            return self._shared_client
+        return self._client
+
+    @staticmethod
+    def _scope_for_layer(layer: str) -> str:
+        """Determine scope (private/shared) from memory layer. L0/L1 → private, L2/L3 → shared."""
+        if layer in ("L2", "L3"):
+            return "shared"
+        return "private"
 
     def on_memory_write(
         self,
@@ -643,17 +826,39 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return
 
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
+        # Infer verification metadata from write origin
+        verification_type = "auto_extracted"
+        if metadata:
+            write_origin = metadata.get("write_origin", "")
+            exec_ctx = metadata.get("execution_context", "")
+            if write_origin == "background_review":
+                verification_type = "auto_extracted"
+            elif write_origin == "assistant_tool" and exec_ctx == "foreground":
+                verification_type = "explicit_confirmation"
+            elif write_origin == "user_direct":
+                verification_type = "user_feedback"
+        effective_layer = "L1" if subdir in ("preferences", "entities") else "L2"
+        write_scope = self._scope_for_layer(effective_layer)
+        front_matter = self._build_front_matter(
+            verified=(verification_type != "auto_extracted"),
+            verification_type=verification_type,
+            layer=effective_layer,
+            created_by=self._user,
+            scope=write_scope,
+        )
+        full_content = front_matter + content
 
         def _write():
             try:
-                client = _VikingClient(
-                    self._endpoint, self._api_key,
-                    account=self._account, user=self._user, agent=self._agent,
-                )
-                client.post("/api/v1/content/write", {
-                    "uri": uri,
-                    "content": content,
+                write_client = self._client_for_scope(write_scope)
+                if not write_client:
+                    write_client = self._client
+                if not write_client:
+                    return
+                write_uri = self._build_memory_uri(subdir, scope=write_scope)
+                write_client.post("/api/v1/content/write", {
+                    "uri": write_uri,
+                    "content": full_content,
                     "mode": "create",
                 })
             except Exception as e:
@@ -663,7 +868,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         t.start()
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, ADD_RESOURCE_SCHEMA]
+        return [SEARCH_SCHEMA, READ_SCHEMA, BROWSE_SCHEMA, REMEMBER_SCHEMA, FORGET_SCHEMA, FEEDBACK_SCHEMA, ADD_RESOURCE_SCHEMA]
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._client:
@@ -678,6 +883,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return self._tool_browse(args)
             elif tool_name == "viking_remember":
                 return self._tool_remember(args)
+            elif tool_name == "viking_forget":
+                return self._tool_forget(args)
+            elif tool_name == "viking_feedback":
+                return self._tool_feedback(args)
             elif tool_name == "viking_add_resource":
                 return self._tool_add_resource(args)
             return tool_error(f"Unknown tool: {tool_name}")
@@ -741,6 +950,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if not query:
             return tool_error("query is required")
 
+        scope = args.get("scope", "all")
+
         payload: Dict[str, Any] = {"query": query}
         mode = args.get("mode", "auto")
         if mode != "auto":
@@ -753,25 +964,70 @@ class OpenVikingMemoryProvider(MemoryProvider):
         resp = self._client.post("/api/v1/search/find", payload)
         result = resp.get("result", {})
 
-        # Format results for the model — keep it concise
+        # Format results for the model — keep it concise, label with memory layer
         scored_entries = []
         for ctx_type in ("memories", "resources", "skills"):
             items = result.get(ctx_type, [])
             for item in items:
                 raw_score = item.get("score")
                 sort_score = raw_score if raw_score is not None else 0.0
+                uri = item.get("uri", "")
+                # Determine layer from URI path
+                layer_label = "L1"
+                if "/_archived/" in uri:
+                    layer_label = "L3"
+                elif ctx_type == "skills" or "/patterns/" in uri or "/cases/" in uri:
+                    layer_label = "L2"
+                elif "/preferences/" in uri or "/entities/" in uri:
+                    layer_label = "L1"
+                elif ctx_type == "resources":
+                    layer_label = "L1"
                 entry = {
-                    "uri": item.get("uri", ""),
+                    "uri": uri,
                     "type": ctx_type.rstrip("s"),
+                    "layer": layer_label,
                     "score": round(raw_score, 3) if raw_score is not None else 0.0,
                     "abstract": item.get("abstract", ""),
                 }
+                # Add verification tag from abstract content if present
+                abstract_text = item.get("abstract", "")
+                if "verified: true" in abstract_text:
+                    entry["verification"] = "verified"
+                elif "verified: false" in abstract_text:
+                    entry["verification"] = "unverified"
                 if item.get("relations"):
                     entry["related"] = [r.get("uri") for r in item["relations"][:3]]
                 scored_entries.append((sort_score, entry))
 
         scored_entries.sort(key=lambda x: x[0], reverse=True)
-        formatted = [entry for _, entry in scored_entries]
+        # Filter by scope if specified
+        if scope != "all":
+            filtered_entries = []
+            for sort_score, entry in scored_entries:
+                uri = entry.get("uri", "")
+                is_shared = f"/user/{self._team_user}/" in uri
+                if scope == "shared" and is_shared:
+                    filtered_entries.append((sort_score, entry))
+                elif scope == "private" and not is_shared:
+                    filtered_entries.append((sort_score, entry))
+            scored_entries = filtered_entries
+        # Filter out archived entries (redirect markers), deprioritize low-priority entries
+        active_entries = []
+        deprioritized_entries = []
+        for sort_score, entry in scored_entries:
+            uri = entry.get("uri", "")
+            abstract = entry.get("abstract", "")
+            scope_label = "SHARED" if f"/user/{self._team_user}/" in uri else "PRIVATE"
+            entry["scope"] = scope_label
+            # Skip archived entries (redirect markers or _archived/ URIs)
+            if "/_archived/" in uri or abstract.startswith("-> "):
+                continue
+            # Check for deprioritized marker
+            if "[DEPRIORITIZED]" in abstract or "priority: low" in abstract:
+                deprioritized_entries.append(entry)
+            else:
+                active_entries.append(entry)
+        formatted = active_entries + deprioritized_entries
 
         return json.dumps({
             "results": formatted,
@@ -883,32 +1139,315 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         return json.dumps(result, ensure_ascii=False)
 
+    # Map layer parameter to category subdirectory for explicit layer selection.
+    _LAYER_SUBDIR_MAP = {
+        "L1": "preferences",  # Stable facts: preferences, environment info
+        "L2": "patterns",     # Deep knowledge: SOPs, workflows, patterns
+    }
+
+    @staticmethod
+    def _build_front_matter(verified: bool, verification_type: str, layer: str,
+                            created_by: str = "", scope: str = "private") -> str:
+        """Build YAML front-matter for memory content with verification and feedback metadata."""
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        lines = [
+            "---",
+            f"verified: {'true' if verified else 'false'}",
+            f"verification_type: {verification_type}",
+            f"created_at: {ts}",
+            f"layer: {layer}",
+            f"scope: {scope}",
+        ]
+        if created_by:
+            lines.append(f"created_by: {created_by}")
+        if scope == "shared":
+            lines.extend([
+                "usage_count: 0",
+                "success_count: 0",
+                "failure_count: 0",
+                f"last_used_at: {ts}",
+                "last_outcome: none",
+            ])
+        lines.append("---")
+        return "\n".join(lines) + "\n"
+
     def _tool_remember(self, args: dict) -> str:
         content = args.get("content", "")
         if not content:
             return tool_error("content is required")
 
         category = args.get("category", "")
-        subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
-        uri = self._build_memory_uri(subdir)
+        layer = args.get("layer", "auto")
+        verified = args.get("verified", False)
+        verification_type = args.get("verification_type", "auto_extracted")
+        # Layer takes precedence over category for subdir selection.
+        if layer in self._LAYER_SUBDIR_MAP:
+            subdir = self._LAYER_SUBDIR_MAP[layer]
+        elif category:
+            subdir = _CATEGORY_SUBDIR_MAP.get(category, _DEFAULT_MEMORY_SUBDIR)
+        else:
+            subdir = _DEFAULT_MEMORY_SUBDIR
+        # Determine effective layer label for front-matter
+        effective_layer = layer if layer != "auto" else ("L1" if subdir in ("preferences", "entities") else "L2")
+        # Determine scope: where to write this memory
+        scope_param = args.get("scope", "auto")
+        if scope_param == "private":
+            write_scope = "private"
+        elif scope_param == "shared":
+            write_scope = "shared"
+        else:
+            write_scope = self._scope_for_layer(effective_layer)
+        uri = self._build_memory_uri(subdir, scope=write_scope)
+        # Prepend verification front-matter to content
+        front_matter = self._build_front_matter(verified, verification_type, effective_layer, created_by=self._user, scope=write_scope)
+        full_content = front_matter + content
 
         # Write directly via content/write API.
         # This creates the file, stores the content, and queues vector indexing
         # in a single call — no dependency on session commit / VLM extraction.
+        write_client = self._client_for_scope(write_scope)
+        if not write_client:
+            return tool_error("OpenViking server not connected for scope: " + write_scope)
         try:
-            result = self._client.post("/api/v1/content/write", {
+            result = write_client.post("/api/v1/content/write", {
                 "uri": uri,
-                "content": content,
+                "content": full_content,
                 "mode": "create",
             })
             written = result.get("result", {}).get("written_bytes", 0)
             return json.dumps({
                 "status": "stored",
+                "layer": effective_layer,
+                "scope": write_scope,
+                "verified": verified,
+                "verification_type": verification_type,
                 "message": f"Memory stored ({written}b) and queued for vector indexing.",
             })
         except Exception as e:
             logger.error("OpenViking content/write failed: %s", e)
             return tool_error(f"Failed to store memory: {e}")
+
+    def _tool_forget(self, args: dict) -> str:
+        uri = args.get("uri", "")
+        if not uri:
+            return tool_error("uri is required")
+
+        mode = args.get("mode", "archive")
+        reason = args.get("reason", "")
+
+        if mode == "archive":
+            # Read original content, write to _archived/, overwrite original with redirect marker
+            try:
+                # Read original
+                resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+                result = self._unwrap_result(resp)
+                if isinstance(result, str):
+                    original_content = result
+                elif isinstance(result, dict):
+                    original_content = result.get("content", "") or result.get("text", "")
+                else:
+                    original_content = ""
+
+                if not original_content:
+                    return tool_error(f"No content found at {uri}")
+
+                # Build archive URI: replace /memories/ with /memories/_archived/
+                archive_uri = uri.replace("/memories/", "/memories/_archived/", 1)
+                if archive_uri == uri:
+                    # Fallback: prepend _archived/ before the filename
+                    parts = uri.rsplit("/", 1)
+                    if len(parts) == 2:
+                        archive_uri = f"{parts[0]}/_archived/{parts[1]}"
+
+                # Write to archive location
+                from datetime import datetime, timezone
+                ts = datetime.now(timezone.utc).isoformat()
+                archive_content = original_content
+                if reason:
+                    archive_content += f"\n\n[Archived at {ts}. Reason: {reason}]"
+
+                self._client.post("/api/v1/content/write", {
+                    "uri": archive_uri,
+                    "content": archive_content,
+                    "mode": "create",
+                })
+
+                # Overwrite original with redirect marker (use "update" mode, fallback to "create")
+                redirect_marker = f"-> {archive_uri}\n[Archived at {ts}]"
+                if reason:
+                    redirect_marker += f"\nReason: {reason}"
+                try:
+                    self._client.post("/api/v1/content/write", {
+                        "uri": uri,
+                        "content": redirect_marker,
+                        "mode": "update",
+                    })
+                except Exception:
+                    # If update mode fails, try create (may leave duplicate)
+                    self._client.post("/api/v1/content/write", {
+                        "uri": uri,
+                        "content": redirect_marker,
+                        "mode": "create",
+                    })
+
+                return json.dumps({
+                    "status": "archived",
+                    "original_uri": uri,
+                    "archive_uri": archive_uri,
+                    "message": f"Memory archived. Original replaced with redirect marker.",
+                })
+            except Exception as e:
+                logger.error("OpenViking forget/archive failed: %s", e)
+                return tool_error(f"Failed to archive memory: {e}")
+
+        elif mode == "deprioritize":
+            # Write a .meta.json sidecar with low priority
+            try:
+                meta_uri = uri.rsplit(".", 1)
+                if len(meta_uri) == 2:
+                    meta_uri = f"{meta_uri[0]}.meta.json"
+                else:
+                    meta_uri = f"{uri}.meta.json"
+
+                from datetime import datetime, timezone
+                ts = datetime.now(timezone.utc).isoformat()
+                meta_content = json.dumps({
+                    "priority": "low",
+                    "deprioritized_at": ts,
+                    "reason": reason or "deprioritized by agent",
+                })
+
+                self._client.post("/api/v1/content/write", {
+                    "uri": meta_uri,
+                    "content": meta_content,
+                    "mode": "create",
+                })
+
+                return json.dumps({
+                    "status": "deprioritized",
+                    "uri": uri,
+                    "meta_uri": meta_uri,
+                    "message": "Memory deprioritized. Will rank lower in search results.",
+                })
+            except Exception as e:
+                logger.error("OpenViking forget/deprioritize failed: %s", e)
+                return tool_error(f"Failed to deprioritize memory: {e}")
+
+        return tool_error(f"Unknown forget mode: {mode}")
+
+    def _tool_feedback(self, args: dict) -> str:
+        uri = args.get("uri", "")
+        if not uri:
+            return tool_error("uri is required")
+        outcome = args.get("outcome", "")
+        if outcome not in ("success", "failure", "partial"):
+            return tool_error("outcome must be one of: success, failure, partial")
+        note = args.get("note", "")
+
+        # Determine which client to use based on URI
+        is_shared = f"/user/{self._team_user}/" in uri
+        feedback_client = self._shared_client if is_shared else self._client
+        if not feedback_client:
+            return tool_error("OpenViking server not connected")
+
+        # Read current content
+        try:
+            resp = feedback_client.get("/api/v1/content/read", params={"uri": uri})
+            result = self._unwrap_result(resp)
+            if isinstance(result, str):
+                current_content = result
+            elif isinstance(result, dict):
+                current_content = result.get("content", "") or result.get("text", "")
+            else:
+                current_content = ""
+
+            if not current_content:
+                return tool_error(f"No content found at {uri}")
+        except Exception as e:
+            return tool_error(f"Failed to read memory for feedback: {e}")
+
+        # Parse and update YAML front-matter
+        import re
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+
+        front_matter_match = re.match(r'^---\n(.*?)\n---\n', current_content, re.DOTALL)
+        if front_matter_match:
+            fm_text = front_matter_match.group(1)
+            body = current_content[front_matter_match.end():]
+            # Update counters
+            usage_count = 0
+            success_count = 0
+            failure_count = 0
+            for line in fm_text.split("\n"):
+                if line.startswith("usage_count:"):
+                    try:
+                        usage_count = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.startswith("success_count:"):
+                    try:
+                        success_count = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif line.startswith("failure_count:"):
+                    try:
+                        failure_count = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+
+            usage_count += 1
+            if outcome == "success":
+                success_count += 1
+            elif outcome == "failure":
+                failure_count += 1
+
+            # Rebuild front-matter lines
+            new_fm_lines = []
+            skip_keys = {"usage_count", "success_count", "failure_count", "last_used_at", "last_outcome"}
+            for line in fm_text.split("\n"):
+                key = line.split(":", 1)[0].strip() if ":" in line else ""
+                if key in skip_keys:
+                    continue
+                new_fm_lines.append(line)
+            new_fm_lines.append(f"usage_count: {usage_count}")
+            new_fm_lines.append(f"success_count: {success_count}")
+            new_fm_lines.append(f"failure_count: {failure_count}")
+            new_fm_lines.append(f"last_used_at: {ts}")
+            new_fm_lines.append(f"last_outcome: {outcome}")
+
+            new_fm = "---\n" + "\n".join(new_fm_lines) + "\n---\n"
+            new_content = new_fm + body
+        else:
+            # No front-matter — append feedback as a comment
+            new_content = current_content + f"\n\n[Feedback at {ts}: {outcome}" + (f" — {note}" if note else "") + "]"
+
+        # Write back
+        try:
+            feedback_client.post("/api/v1/content/write", {
+                "uri": uri,
+                "content": new_content,
+                "mode": "update",
+            })
+        except Exception:
+            # Fallback to create mode
+            try:
+                feedback_client.post("/api/v1/content/write", {
+                    "uri": uri,
+                    "content": new_content,
+                    "mode": "create",
+                })
+            except Exception as e:
+                return tool_error(f"Failed to write feedback: {e}")
+
+        return json.dumps({
+            "status": "feedback_recorded",
+            "uri": uri,
+            "outcome": outcome,
+            "note": note,
+            "message": f"Feedback recorded: {outcome}",
+        })
 
     def _tool_add_resource(self, args: dict) -> str:
         url = args.get("url", "")
