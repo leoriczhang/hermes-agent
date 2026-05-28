@@ -54,8 +54,19 @@ logger = logging.getLogger(__name__)
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the profile-scoped memories directory.
+
+    Memory is further partitioned by OPENVIKING_USER so different tenants
+    sharing the same machine/profile don't see each other's USER.md /
+    MEMORY.md.  Falls back to the legacy un-partitioned directory when
+    OPENVIKING_USER is unset, preserving existing layouts for users who
+    don't run with the OpenViking memory plugin.
+    """
+    base = get_hermes_home() / "memories"
+    tenant = os.environ.get("OPENVIKING_USER", "").strip()
+    if tenant:
+        return base / tenant
+    return base
 
 ENTRY_DELIMITER = "\n§\n"
 

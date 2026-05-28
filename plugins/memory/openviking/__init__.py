@@ -43,6 +43,22 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+def _current_os_user() -> str:
+    """Return the current OS login name to use as the default OPENVIKING_USER.
+
+    Falls back to "default" if the user cannot be determined (e.g. headless env
+    where neither $USER nor pwd lookup succeed).
+    """
+    try:
+        import getpass
+        name = getpass.getuser()
+        if name:
+            return name
+    except Exception:
+        pass
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "default"
+
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
 _REMOTE_RESOURCE_PREFIXES = ("http://", "https://", "git@", "ssh://", "git://")
@@ -122,7 +138,7 @@ class _VikingClient:
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
         self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
-        self._user = user or os.environ.get("OPENVIKING_USER", "default")
+        self._user = user or os.environ.get("OPENVIKING_USER") or _current_os_user()
         self._agent = agent or os.environ.get("OPENVIKING_AGENT", "hermes")
         self._httpx = _get_httpx()
         if self._httpx is None:
@@ -551,8 +567,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
             },
             {
                 "key": "user",
-                "description": "OpenViking user ID within the account ([default], used when local mode, OPENVIKING_API_KEY is empty)",
-                "default": "default",
+                "description": "OpenViking user ID within the account (defaults to the current OS user, used when local mode, OPENVIKING_API_KEY is empty)",
+                "default": _current_os_user(),
                 "env_var": "OPENVIKING_USER",
             },
             {
@@ -573,7 +589,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._endpoint = os.environ.get("OPENVIKING_ENDPOINT", _DEFAULT_ENDPOINT)
         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
         self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
-        self._user = os.environ.get("OPENVIKING_USER", "default")
+        self._user = os.environ.get("OPENVIKING_USER") or _current_os_user()
         self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
         self._session_id = session_id
         self._turn_count = 0
