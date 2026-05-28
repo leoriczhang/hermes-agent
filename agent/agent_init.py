@@ -1067,11 +1067,19 @@ def init_agent(
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
+            agent._memory_nudge_message_threshold = int(mem_config.get("nudge_message_threshold", 0))
+            agent._memory_nudge_token_threshold = int(mem_config.get("nudge_token_threshold", 0))
+            # Team/cluster config — set as env vars so OpenViking provider picks them up
+            team_user = mem_config.get("team_user", "__team__")
+            os.environ.setdefault("OPENVIKING_TEAM_USER", team_user)
+            if mem_config.get("feedback_tracking", True):
+                os.environ.setdefault("OPENVIKING_FEEDBACK_TRACKING", "1")
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
+                    capacity_mode=mem_config.get("capacity_mode", "strict"),
                 )
                 agent._memory_store.load_from_disk()
         except Exception:

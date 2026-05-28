@@ -1290,6 +1290,22 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Context-threshold nudge triggers (0 = disabled, turn-based nudge only).
+        "nudge_message_threshold": 0,  # Trigger nudge when conversation exceeds N messages
+        "nudge_token_threshold": 0,    # Trigger nudge when estimated tokens exceed N
+        # Capacity mode: "strict" = reject writes exceeding limit (default),
+        # "dynamic" = compress low-priority entries to make space.
+        "capacity_mode": "strict",
+        # Team/cluster memory settings
+        "team_user": "__team__",          # OpenViking user header for shared L2/L3 space
+        "feedback_tracking": True,         # Auto-track usage outcomes on shared memories
+        # Curator cluster settings
+        "curator_memory_personal_interval_hours": 168,  # Personal curator: 7 days
+        "curator_memory_cluster_enabled": True,
+        "curator_memory_cluster_interval_hours": 72,    # Cluster curator: 3 days
+        "curator_promotion_threshold": 0.8,  # Quality score to promote to shared
+        "curator_archive_failure_rate": 0.4, # Archive if failure rate > 40%
+        "curator_stale_days": 30,            # Mark stale after 30 days unused
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

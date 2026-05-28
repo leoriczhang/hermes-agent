@@ -420,3 +420,89 @@ def test_viking_client_health_sends_auth_headers(monkeypatch):
     assert client.health() is True
     assert captured["url"] == "https://example.com/health"
     assert captured["headers"]["Authorization"] == "Bearer test-key"
+
+
+# --- Cluster Evolution Memory Tests ---
+
+def test_scope_for_layer():
+    """L0/L1 route to private, L2/L3 route to shared."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    p = OpenVikingMemoryProvider()
+    assert p._scope_for_layer("L0") == "private"
+    assert p._scope_for_layer("L1") == "private"
+    assert p._scope_for_layer("L2") == "shared"
+    assert p._scope_for_layer("L3") == "shared"
+
+
+def test_build_memory_uri_scope():
+    """URI building respects scope parameter."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    p = OpenVikingMemoryProvider()
+    p._user = "zhangsan"
+    p._team_user = "__team__"
+    private_uri = p._build_memory_uri("preferences", scope="private")
+    shared_uri = p._build_memory_uri("patterns", scope="shared")
+    assert "/user/zhangsan/" in private_uri
+    assert "/user/__team__/" in shared_uri
+
+
+def test_client_for_scope():
+    """_client_for_scope returns the right client."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    p = OpenVikingMemoryProvider()
+    p._client = "private_client"
+    p._shared_client = "shared_client"
+    assert p._client_for_scope("private") == "private_client"
+    assert p._client_for_scope("shared") == "shared_client"
+    # Fallback when shared is None
+    p._shared_client = None
+    assert p._client_for_scope("shared") == "private_client"
+
+
+def test_viking_feedback_schema():
+    """viking_feedback tool is registered."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    p = OpenVikingMemoryProvider()
+    names = [s["name"] for s in p.get_tool_schemas()]
+    assert "viking_feedback" in names
+
+
+def test_search_scope_parameter():
+    """viking_search schema includes scope parameter."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    p = OpenVikingMemoryProvider()
+    schemas = {s["name"]: s for s in p.get_tool_schemas()}
+    search_props = schemas["viking_search"]["parameters"]["properties"]
+    assert "scope" in search_props
+    assert search_props["scope"]["enum"] == ["all", "private", "shared"]
+
+
+def test_remember_scope_parameter():
+    """viking_remember schema includes scope parameter."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    p = OpenVikingMemoryProvider()
+    schemas = {s["name"]: s for s in p.get_tool_schemas()}
+    remember_props = schemas["viking_remember"]["parameters"]["properties"]
+    assert "scope" in remember_props
+    assert remember_props["scope"]["enum"] == ["auto", "private", "shared"]
+
+
+def test_front_matter_shared_includes_feedback():
+    """Shared front-matter includes feedback counters."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    fm = OpenVikingMemoryProvider._build_front_matter(
+        True, "execution", "L2", "zhangsan", "shared"
+    )
+    assert "usage_count: 0" in fm
+    assert "created_by: zhangsan" in fm
+    assert "scope: shared" in fm
+
+
+def test_front_matter_private_no_feedback():
+    """Private front-matter does not include feedback counters."""
+    from plugins.memory.openviking import OpenVikingMemoryProvider
+    fm = OpenVikingMemoryProvider._build_front_matter(
+        True, "execution", "L1", "zhangsan", "private"
+    )
+    assert "usage_count" not in fm
+    assert "scope: private" in fm

@@ -1775,7 +1775,269 @@ def maybe_run_curator(
             min_idle_s = get_min_idle_hours() * 3600.0
             if idle_for_seconds < min_idle_s:
                 return None
-        return run_curator_review(on_summary=on_summary)
+        result = run_curator_review(on_summary=on_summary)
+        # After skills curator, run memory curators if OpenViking is configured
+        try:
+            run_memory_curator_review(on_summary=on_summary)
+        except Exception as e:
+            logger.debug("Memory curator pass failed: %s", e, exc_info=True)
+        try:
+            run_cluster_curator_review(on_summary=on_summary)
+        except Exception as e:
+            logger.debug("Cluster curator pass failed: %s", e, exc_info=True)
+        return result
     except Exception as e:
         logger.debug("maybe_run_curator failed: %s", e, exc_info=True)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Memory Curator — background maintenance for OpenViking knowledge base
+# ---------------------------------------------------------------------------
+
+_MEMORY_CURATOR_REVIEW_PROMPT = """\
+You are the Personal Memory Curator for an OpenViking knowledge base.
+You operate on the user's private memory space.
+
+## Your Tasks
+
+1. **Deduplicate**: Search for similar/duplicate memories. If found, merge them
+   into one consolidated entry using viking_remember, then archive the originals
+   using viking_forget.
+
+2. **Compress**: Find verbose memories and write concise replacements. Archive
+   the originals.
+
+3. **Archive outdated**: Find memories that reference old environments, deprecated
+   tools, or stale information. Archive them with a reason.
+
+4. **Verify unverified**: Find memories with verified: false in their content.
+   If you can confirm the information from context, re-store it with verified: true.
+
+5. **Identify promotion candidates**: Find high-quality L2/L3 memories (SOPs,
+   workflows, patterns) that would benefit the whole team. Tag them by adding
+   [PROMOTION_CANDIDATE] at the start of the content. The Cluster Curator will
+   review and promote them to the shared team space.
+
+## Rules
+- NEVER delete memories — always use viking_forget (archive mode)
+- Always provide a reason when archiving
+- Preserve the layer (L1/L2) of merged memories
+- Keep the front-matter metadata when re-storing
+- Only promote L2/L3 content — never promote L0/L1 private facts
+
+Browse the knowledge base with viking_browse, search with viking_search,
+read details with viking_read, store with viking_remember, archive with viking_forget.
+"""
+
+_CLUSTER_CURATOR_REVIEW_PROMPT = """\
+You are the Cluster Curator for a team's shared OpenViking knowledge base.
+You operate on the shared team space (user=__team__).
+
+## Your Tasks
+
+1. **Review promotion candidates**: Search for memories tagged [PROMOTION_CANDIDATE]
+   in personal spaces. For each candidate, evaluate quality and relevance.
+   Approved: write to shared space with viking_remember scope=shared.
+   Rejected: leave in place.
+
+2. **Deduplicate shared memories**: Find similar entries in the shared space.
+   Merge duplicates into one consolidated entry.
+
+3. **Feedback-driven optimization**: Check usage metadata in front-matter:
+   - High success rate (success_count/usage_count > 0.8): Priority boost
+   - Mixed results (0.4-0.8): Flag for revision, note failure contexts
+   - Low success rate (< 0.4): Archive with viking_forget, reason="consistently failing"
+   - No usage (last_used_at > 30 days ago): Mark stale
+
+4. **Compress and consolidate**: Merge related shared memories into concise entries.
+
+5. **Archive obsolete**: SOPs that consistently fail, patterns superseded by better ones.
+
+6. **Generate evolution report**: Summarize what was promoted, revised, archived.
+
+## Rules
+- NEVER delete memories — always use viking_forget (archive mode)
+- Always write scope=shared when using viking_remember
+- Use viking_feedback to review feedback data
+- Preserve the layer (L2/L3) and front-matter metadata
+"""
+
+
+def _is_openviking_configured() -> bool:
+    """Check if OpenViking memory provider is active."""
+    try:
+        import os
+        return bool(os.environ.get("OPENVIKING_ENDPOINT"))
+    except Exception:
+        return False
+
+
+def run_memory_curator_review(
+    on_summary: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run a memory curator review pass over the OpenViking knowledge base.
+
+    Spawns a forked AIAgent with viking_* tools to perform deduplication,
+    compression, and archival of memories. Only runs when OpenViking is configured.
+    """
+    if not _is_openviking_configured():
+        return None
+
+    try:
+        from agent.agent_init import create_agent
+        from agent.runtime_resolver import resolve_runtime_provider
+    except ImportError:
+        logger.debug("Memory curator: agent init not available")
+        return None
+
+    start = datetime.now(timezone.utc)
+
+    def _run():
+        try:
+            # Resolve auxiliary runtime for the curator fork
+            cfg = {}
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config() or {}
+            except Exception:
+                pass
+
+            runtime = resolve_runtime_provider(cfg, task="curator")
+            if runtime is None:
+                logger.debug("Memory curator: no runtime available")
+                return
+
+            # Create a forked agent with viking tools only
+            fork = create_agent(
+                model=runtime.get("model", ""),
+                provider=runtime.get("provider", ""),
+                api_key=runtime.get("api_key", ""),
+                base_url=runtime.get("base_url", ""),
+                skip_memory=True,
+                system_message=_MEMORY_CURATOR_REVIEW_PROMPT,
+                tool_whitelist=[
+                    "viking_search", "viking_read", "viking_browse",
+                    "viking_remember", "viking_forget",
+                ],
+                max_turns=30,
+            )
+
+            # Run the review
+            from agent.conversation_loop import run_conversation_turn
+            result = run_conversation_turn(
+                fork,
+                user_message="Run a memory curator review. Start by browsing the knowledge base structure, then search for duplicates, verbose entries, and outdated information. Take action on what you find.",
+            )
+
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            summary = f"memory curator completed ({elapsed:.0f}s)"
+
+            if on_summary:
+                try:
+                    on_summary(summary)
+                except Exception:
+                    pass
+
+            return {"summary": summary, "elapsed": elapsed}
+
+        except Exception as e:
+            logger.debug("Memory curator LLM pass failed: %s", e, exc_info=True)
+            if on_summary:
+                try:
+                    on_summary(f"memory curator: error ({e})")
+                except Exception:
+                    pass
+            return None
+
+    # Run in a daemon thread so we don't block the caller
+    t = threading.Thread(target=_run, daemon=True, name="memory-curator")
+    t.start()
+
+    return {"started_at": start.isoformat(), "mode": "async"}
+
+
+def run_cluster_curator_review(
+    on_summary: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run a cluster curator review pass over the shared team knowledge base."""
+    if not _is_openviking_configured():
+        return None
+
+    try:
+        from agent.agent_init import create_agent
+        from agent.runtime_resolver import resolve_runtime_provider
+    except ImportError:
+        logger.debug("Cluster curator: agent init not available")
+        return None
+
+    start = datetime.now(timezone.utc)
+
+    def _run():
+        try:
+            cfg = {}
+            try:
+                from hermes_cli.config import load_config
+                cfg = load_config() or {}
+            except Exception:
+                pass
+
+            runtime = resolve_runtime_provider(cfg, task="curator")
+            if runtime is None:
+                logger.debug("Cluster curator: no runtime available")
+                return
+
+            import os
+            os.environ["OPENVIKING_TEAM_USER"] = os.environ.get("OPENVIKING_TEAM_USER", "__team__")
+
+            fork = create_agent(
+                model=runtime.get("model", ""),
+                provider=runtime.get("provider", ""),
+                api_key=runtime.get("api_key", ""),
+                base_url=runtime.get("base_url", ""),
+                skip_memory=True,
+                system_message=_CLUSTER_CURATOR_REVIEW_PROMPT,
+                tool_whitelist=[
+                    "viking_search", "viking_read", "viking_browse",
+                    "viking_remember", "viking_forget", "viking_feedback",
+                ],
+                max_turns=40,
+            )
+
+            from agent.conversation_loop import run_conversation_turn
+            result = run_conversation_turn(
+                fork,
+                user_message=(
+                    "Run a cluster curator review. "
+                    "1) Search for [PROMOTION_CANDIDATE] memories in personal spaces and review them. "
+                    "2) Search shared space for duplicates and merge. "
+                    "3) Check feedback metadata on shared memories and optimize. "
+                    "4) Archive stale or failing shared memories. "
+                    "5) Write an evolution report."
+                ),
+            )
+
+            elapsed = (datetime.now(timezone.utc) - start).total_seconds()
+            summary = f"cluster curator completed ({elapsed:.0f}s)"
+
+            if on_summary:
+                try:
+                    on_summary(summary)
+                except Exception:
+                    pass
+
+            return {"summary": summary, "elapsed": elapsed}
+
+        except Exception as e:
+            logger.debug("Cluster curator LLM pass failed: %s", e, exc_info=True)
+            if on_summary:
+                try:
+                    on_summary(f"cluster curator: error ({e})")
+                except Exception:
+                    pass
+            return None
+
+    t = threading.Thread(target=_run, daemon=True, name="cluster-curator")
+    t.start()
+
+    return {"started_at": start.isoformat(), "mode": "async"}

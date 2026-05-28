@@ -457,7 +457,7 @@ def run_conversation(
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
 
-    # Track memory nudge trigger (turn-based, checked here).
+    # Track memory nudge trigger (turn-based + context-threshold, checked here).
     # Skill trigger is checked AFTER the agent loop completes, based on
     # how many tool iterations THIS turn used.
     _should_review_memory = False
@@ -468,6 +468,19 @@ def run_conversation(
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             _should_review_memory = True
             agent._turns_since_memory = 0
+        # Context-threshold nudge: trigger when message count or token estimate
+        # exceeds configured thresholds (in addition to turn-based nudge).
+        elif hasattr(agent, '_memory_nudge_message_threshold') and agent._memory_nudge_message_threshold > 0:
+            if len(messages) >= agent._memory_nudge_message_threshold:
+                _should_review_memory = True
+                agent._turns_since_memory = 0
+        elif hasattr(agent, '_memory_nudge_token_threshold') and agent._memory_nudge_token_threshold > 0:
+            # Rough token estimate: ~4 chars per token
+            total_chars = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+            est_tokens = total_chars // 4
+            if est_tokens >= agent._memory_nudge_token_threshold:
+                _should_review_memory = True
+                agent._turns_since_memory = 0
 
     # Add user message
     user_msg = {"role": "user", "content": user_message}

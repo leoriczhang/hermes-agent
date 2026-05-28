@@ -122,11 +122,13 @@ class MemoryStore:
         Tool responses always reflect this live state.
     """
 
-    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375):
+    def __init__(self, memory_char_limit: int = 2200, user_char_limit: int = 1375,
+                 capacity_mode: str = "strict"):
         self.memory_entries: List[str] = []
         self.user_entries: List[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
+        self.capacity_mode = capacity_mode  # "strict" (default) or "dynamic"
         # Frozen snapshot for system prompt -- set once at load_from_disk()
         self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
 
@@ -295,6 +297,69 @@ class MemoryStore:
             return self.user_char_limit
         return self.memory_char_limit
 
+    # Priority prefixes for dynamic capacity management
+    _PRIORITY_PREFIXES = ("[P1]", "[P2]", "[P3]")
+
+    @staticmethod
+    def _entry_priority(entry: str) -> int:
+        """Return priority level: 1 (high), 2 (medium), 3 (low). Lower = higher priority."""
+        for i, prefix in enumerate(MemoryStore._PRIORITY_PREFIXES, 1):
+            if entry.strip().startswith(prefix):
+                return i
+        return 2  # Default: medium priority
+
+    def _try_compress_for_space(self, target: str, entries: List[str], needed: int) -> Optional[List[str]]:
+        """Try to free space by compressing low-priority entries.
+
+        Returns new entries list if enough space was freed, None otherwise.
+        Compresses P3 entries first, then P2. P1 entries are never compressed.
+        """
+        # Find compressible entries (P3 first, then P2)
+        p3_indices = [i for i, e in enumerate(entries) if self._entry_priority(e) == 3]
+        p2_indices = [i for i, e in enumerate(entries) if self._entry_priority(e) == 2]
+
+        if not p3_indices and not p2_indices:
+            return None
+
+        # Strategy: merge all P3 entries into one compressed summary
+        result = list(entries)
+        freed = 0
+
+        if p3_indices:
+            p3_entries = [entries[i] for i in p3_indices]
+            p3_total_len = len(ENTRY_DELIMITER.join(p3_entries))
+            # Simple compression: concatenate P3 entries with shorter separator
+            compressed = "[P3] " + " | ".join(
+                e.strip().lstrip("[P3]").lstrip("[P2]").lstrip("[P1]").strip()
+                for e in p3_entries
+            )
+            # Remove P3 entries and add compressed version
+            for i in sorted(p3_indices, reverse=True):
+                result.pop(i)
+            result.append(compressed)
+            freed = p3_total_len - len(compressed)
+
+        if freed >= needed:
+            return result
+
+        # If still not enough, try compressing P2 entries similarly
+        if p2_indices:
+            p2_entries = [entries[i] for i in p2_indices if i < len(result) and self._entry_priority(result[i]) == 2]
+            if p2_entries:
+                p2_total_len = len(ENTRY_DELIMITER.join(p2_entries))
+                compressed = "[P2] " + " | ".join(
+                    e.strip().lstrip("[P3]").lstrip("[P2]").lstrip("[P1]").strip()
+                    for e in p2_entries
+                )
+                # Remove P2 entries from result and add compressed version
+                result = [e for e in result if e not in p2_entries]
+                result.append(compressed)
+                freed += p2_total_len - len(compressed)
+
+        if freed >= needed:
+            return result
+        return result if freed > 0 else None
+
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
         content = content.strip()
@@ -328,12 +393,23 @@ class MemoryStore:
 
             if new_total > limit:
                 current = self._char_count(target)
+                # Dynamic capacity: try compressing low-priority entries
+                if self.capacity_mode == "dynamic":
+                    compressed = self._try_compress_for_space(target, entries, new_total - limit)
+                    if compressed is not None:
+                        entries = compressed
+                        new_total = len(ENTRY_DELIMITER.join(entries + [content]))
+                        if new_total <= limit:
+                            entries.append(content)
+                            self._set_entries(target, entries)
+                            self.save_to_disk(target)
+                            return self._success_response(target, "Entry added (after compressing low-priority entries).")
                 return {
                     "success": False,
                     "error": (
                         f"Memory at {current:,}/{limit:,} chars. "
                         f"Adding this entry ({len(content)} chars) would exceed the limit. "
-                        f"Replace or remove existing entries first."
+                        f"{'Try viking_remember to store in OpenViking instead.' if self.capacity_mode == 'dynamic' else 'Replace or remove existing entries first.'}"
                     ),
                     "current_entries": entries,
                     "usage": f"{current:,}/{limit:,}",

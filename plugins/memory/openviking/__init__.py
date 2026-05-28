@@ -66,6 +66,16 @@ _MEMORY_WRITE_TARGET_SUBDIR_MAP = {
     "memory": "patterns",
 }
 
+# Content keywords that indicate a personal fact (L1) rather than general
+# knowledge (L2).  When on_memory_write receives target="memory" but the
+# content matches one of these patterns, we re-route to preferences/entities.
+_PERSONAL_FACT_KEYWORDS = (
+    "name is", "username", "叫", "名字是", "我的名字", "I am ", "I'm ",
+    "my name", "我的偏好", "my preference", "我喜欢的", "我喜欢",
+    "my environment", "我的环境", "我使用的", "I use ",
+    "我的项目", "my project", "我的工作", "my role", "我的角色",
+)
+
 
 # ---------------------------------------------------------------------------
 # Process-level atexit safety net — ensures pending sessions are committed
@@ -826,6 +836,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return
 
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
+        # Re-route personal facts from patterns (L2) to preferences (L1).
+        # When target="memory" maps to "patterns" but the content describes a
+        # personal/user fact, it belongs in L1 private, not L2 shared.
+        content_lower = content.lower()
+        if subdir == "patterns" and any(kw in content_lower for kw in _PERSONAL_FACT_KEYWORDS):
+            subdir = "preferences"
         # Infer verification metadata from write origin
         verification_type = "auto_extracted"
         if metadata:
@@ -1190,6 +1206,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
             subdir = _DEFAULT_MEMORY_SUBDIR
         # Determine effective layer label for front-matter
         effective_layer = layer if layer != "auto" else ("L1" if subdir in ("preferences", "entities") else "L2")
+        # Re-route personal facts from patterns (L2) to preferences (L1) on auto routing.
+        content_lower = content.lower()
+        if effective_layer == "L2" and any(kw in content_lower for kw in _PERSONAL_FACT_KEYWORDS):
+            subdir = "preferences"
+            effective_layer = "L1"
         # Determine scope: where to write this memory
         scope_param = args.get("scope", "auto")
         if scope_param == "private":
@@ -1235,6 +1256,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         mode = args.get("mode", "archive")
         reason = args.get("reason", "")
+
+        # Gate: shared space archival requires curator confirmation
+        is_shared = f"/user/{self._team_user}/" in uri
+        if is_shared and mode == "archive":
+            if "__curator__" not in reason:
+                return json.dumps({
+                    "status": "needs_curator_approval",
+                    "uri": uri,
+                    "message": (
+                        "Archiving shared memories requires Cluster Curator approval. "
+                        "The curator will review this in the next maintenance cycle. "
+                        "To force, include '__curator__' in the reason."
+                    ),
+                })
 
         if mode == "archive":
             # Read original content, write to _archived/, overwrite original with redirect marker
@@ -1423,23 +1458,18 @@ class OpenVikingMemoryProvider(MemoryProvider):
             # No front-matter — append feedback as a comment
             new_content = current_content + f"\n\n[Feedback at {ts}: {outcome}" + (f" — {note}" if note else "") + "]"
 
-        # Write back
+        # Write back — use a feedback sidecar URI to avoid ALREADY_EXISTS on the original
+        feedback_slug = uuid.uuid4().hex[:8]
+        base_uri = uri.rsplit(".", 1)[0] if "." in uri else uri
+        feedback_uri = f"{base_uri}_feedback_{feedback_slug}.md"
         try:
             feedback_client.post("/api/v1/content/write", {
-                "uri": uri,
+                "uri": feedback_uri,
                 "content": new_content,
-                "mode": "update",
+                "mode": "create",
             })
-        except Exception:
-            # Fallback to create mode
-            try:
-                feedback_client.post("/api/v1/content/write", {
-                    "uri": uri,
-                    "content": new_content,
-                    "mode": "create",
-                })
-            except Exception as e:
-                return tool_error(f"Failed to write feedback: {e}")
+        except Exception as e:
+            return tool_error(f"Failed to write feedback: {e}")
 
         return json.dumps({
             "status": "feedback_recorded",
