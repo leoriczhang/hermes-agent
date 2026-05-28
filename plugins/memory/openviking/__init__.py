@@ -47,17 +47,20 @@ logger = logging.getLogger(__name__)
 def _current_os_user() -> str:
     """Return the current OS login name to use as the default OPENVIKING_USER.
 
-    Falls back to "default" if the user cannot be determined (e.g. headless env
-    where neither $USER nor pwd lookup succeed).
+    Always lowercased so the OpenViking user namespace doesn't fragment by
+    case (e.g. "LiuYue" vs "liuyue" creating two disjoint memory spaces).
+    Falls back to "default" if the user cannot be determined (e.g. headless
+    env where neither $USER nor pwd lookup succeed).
     """
     try:
         import getpass
         name = getpass.getuser()
         if name:
-            return name
+            return name.lower()
     except Exception:
         pass
-    return os.environ.get("USER") or os.environ.get("USERNAME") or "default"
+    name = os.environ.get("USER") or os.environ.get("USERNAME") or "default"
+    return name.lower()
 
 _DEFAULT_ENDPOINT = "http://127.0.0.1:1933"
 _TIMEOUT = 30.0
@@ -852,11 +855,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return
 
         subdir = _MEMORY_WRITE_TARGET_SUBDIR_MAP.get(target, _DEFAULT_MEMORY_SUBDIR)
-        # Re-route personal facts from patterns (L2) to preferences (L1).
-        # When target="memory" maps to "patterns" but the content describes a
-        # personal/user fact, it belongs in L1 private, not L2 shared.
+        # Re-route personal facts to L1 private, regardless of which subdir
+        # they would otherwise land in.  The team (shared) space must never
+        # auto-absorb first-person facts like "my name is", "我叫…", "I use
+        # Python 3.11", because every tenant on the same account would then
+        # be polluted with one user's identity.
         content_lower = content.lower()
-        if subdir == "patterns" and any(kw in content_lower for kw in _PERSONAL_FACT_KEYWORDS):
+        is_personal_fact = any(kw in content_lower for kw in _PERSONAL_FACT_KEYWORDS)
+        if is_personal_fact and subdir not in ("preferences", "entities"):
             subdir = "preferences"
         # Infer verification metadata from write origin
         verification_type = "auto_extracted"
@@ -1235,6 +1241,15 @@ class OpenVikingMemoryProvider(MemoryProvider):
             write_scope = "shared"
         else:
             write_scope = self._scope_for_layer(effective_layer)
+        # Hard guard: a first-person personal fact must never land in the
+        # shared team space, even if the caller explicitly asked for shared.
+        # Team space holds collective knowledge — pollute it with one
+        # tenant's identity once and every other tenant inherits it forever.
+        if write_scope == "shared" and any(kw in content_lower for kw in _PERSONAL_FACT_KEYWORDS):
+            write_scope = "private"
+            if effective_layer == "L2":
+                subdir = "preferences"
+                effective_layer = "L1"
         uri = self._build_memory_uri(subdir, scope=write_scope)
         # Prepend verification front-matter to content
         front_matter = self._build_front_matter(verified, verification_type, effective_layer, created_by=self._user, scope=write_scope)
