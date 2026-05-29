@@ -3434,6 +3434,16 @@ def create_source_router(auth: Optional[GitHubAuth] = None) -> List[SkillSource]
         BrowseShSource(),   # browse.sh: 169+ site-specific browser automation skills
     ]
 
+    # OpenViking team marketplace — only active when the user has
+    # configured an OpenViking endpoint, so absence of the integration
+    # never breaks the regular skill install flow.
+    if os.environ.get("OPENVIKING_ENDPOINT"):
+        try:
+            from tools.skills_hub_openviking_source import OpenVikingSkillSource
+            sources.append(OpenVikingSkillSource())
+        except Exception as exc:
+            logger.debug("OpenVikingSkillSource unavailable: %s", exc)
+
     return sources
 
 
