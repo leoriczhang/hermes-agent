@@ -1738,6 +1738,14 @@ def cmd_chat(args):
     except Exception:
         pass
 
+    # Sync team skills published on OpenViking (cloud-evolved + team-shared).
+    # No-op unless OPENVIKING_ENDPOINT is set; never blocks startup on error.
+    try:
+        from tools.skills_hub import sync_team_skills
+        sync_team_skills(quiet=True)
+    except Exception:
+        pass
+
     # --yolo: bypass all dangerous command approvals
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"

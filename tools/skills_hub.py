@@ -3084,6 +3084,132 @@ def install_from_quarantine(
     return install_dir
 
 
+def sync_team_skills(quiet: bool = True) -> Dict[str, int]:
+    """Auto-install team skills published on OpenViking into the local hub.
+
+    Runs at startup so cloud-evolved (SkillClaw) and team-published skills
+    appear in the local "Available Skills" list without a manual
+    ``hermes skills install``.  Behaviour:
+
+      - No-op unless ``OPENVIKING_ENDPOINT`` is set (mirrors the gating in
+        create_source_router so unconfigured users never pay the cost).
+      - Lists team skills via OpenVikingSkillSource.search(), then for each
+        one not already recorded in the hub lock file (or whose remote
+        content hash changed) fetches + scans + installs it.
+      - Reuses the same quarantine -> scan -> install pipeline as
+        ``do_install`` so security scanning still applies; a ``dangerous``
+        verdict skips that skill rather than aborting the whole sync.
+      - Never raises: any failure degrades to a skipped skill so a flaky
+        OpenViking server can't block hermes startup.
+
+    Returns a counts dict: ``{installed, updated, skipped, failed, total}``.
+    """
+    counts = {"installed": 0, "updated": 0, "skipped": 0, "failed": 0, "total": 0}
+    if not os.environ.get("OPENVIKING_ENDPOINT"):
+        return counts
+
+    try:
+        from tools.skills_hub_openviking_source import OpenVikingSkillSource
+        from tools.skills_guard import scan_skill, should_allow_install
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Team skill sync unavailable: %s", exc)
+        return counts
+
+    try:
+        source = OpenVikingSkillSource()
+    except Exception as exc:
+        logger.debug("Could not construct OpenVikingSkillSource: %s", exc)
+        return counts
+    if source._client is None:
+        return counts
+
+    try:
+        metas = source.search("", limit=100)
+    except Exception as exc:
+        logger.debug("Team skill listing failed: %s", exc)
+        return counts
+
+    lock = HubLockFile()
+    for meta in metas:
+        counts["total"] += 1
+        name = meta.name
+        identifier = meta.identifier
+        try:
+            existing = lock.get_installed(name)
+            # Only re-sync an already-installed skill when it originally came
+            # from OpenViking — never clobber a hand-installed/local skill of
+            # the same name.
+            if existing and existing.get("source") != "openviking":
+                counts["skipped"] += 1
+                continue
+
+            bundle = source.fetch(identifier)
+            if bundle is None:
+                # fetch() returns None for empty-shell skill dirs (no
+                # SKILL.md / no files) — these are legacy placeholders, not
+                # real failures, so count them as skipped.
+                counts["skipped"] += 1
+                continue
+
+            # Skip when the remote bundle is byte-identical to what we have.
+            remote_hash = _bundle_files_hash(bundle.files)
+            if existing and existing.get("metadata", {}).get("remote_bundle_hash") == remote_hash:
+                counts["skipped"] += 1
+                continue
+
+            q_path = quarantine_bundle(bundle)
+            scan_source = bundle.identifier or identifier
+            result = scan_skill(q_path, source=scan_source)
+            allowed, reason = should_allow_install(result, force=False)
+            if not allowed:
+                shutil.rmtree(q_path, ignore_errors=True)
+                append_audit_log(
+                    "BLOCKED", name, bundle.source, bundle.trust_level,
+                    result.verdict, "team_sync",
+                )
+                if not quiet:
+                    logger.warning("Team skill '%s' blocked by scan: %s", name, reason)
+                counts["skipped"] += 1
+                continue
+
+            # Stamp the remote hash so the next sync can detect changes.
+            bundle.metadata = dict(bundle.metadata or {})
+            bundle.metadata["remote_bundle_hash"] = remote_hash
+
+            # Team skills install flat (no category) — the slug is the dir.
+            install_from_quarantine(q_path, bundle.name, "", bundle, result)
+            if existing:
+                counts["updated"] += 1
+            else:
+                counts["installed"] += 1
+        except Exception as exc:
+            logger.debug("Team skill sync failed for %s: %s", name, exc)
+            counts["failed"] += 1
+            continue
+
+    if not quiet and (counts["installed"] or counts["updated"]):
+        logger.info(
+            "Team skill sync: %d installed, %d updated, %d skipped",
+            counts["installed"], counts["updated"], counts["skipped"],
+        )
+    return counts
+
+
+def _bundle_files_hash(files: Dict[str, Any]) -> str:
+    """Stable hash of a bundle's files map for change detection."""
+    h = hashlib.sha256()
+    for rel in sorted(files.keys()):
+        h.update(rel.encode("utf-8", "replace"))
+        h.update(b"\0")
+        val = files[rel]
+        if isinstance(val, str):
+            h.update(val.encode("utf-8", "replace"))
+        elif isinstance(val, (bytes, bytearray)):
+            h.update(bytes(val))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
 def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     """Remove a hub-installed skill. Refuses to remove builtins."""
     lock = HubLockFile()

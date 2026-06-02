@@ -371,7 +371,15 @@ class OpenVikingSkillSource(SkillSource):
         return _extract_description(body)
 
     def _read_file(self, uri: str) -> Optional[str]:
-        resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+        try:
+            resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+        except Exception as exc:
+            # Missing files (e.g. an empty-shell skill directory with no
+            # SKILL.md) surface as RuntimeError("NOT_FOUND: ...") from the
+            # client.  Treat any read failure as "absent" so callers can
+            # skip the skill cleanly instead of crashing the whole sync.
+            logger.debug("OpenViking read failed for %s: %s", uri, exc)
+            return None
         result = resp.get("result")
         # OpenViking content/read returns the body as a plain string in
         # ``result``; older shapes nested it under result.content.
