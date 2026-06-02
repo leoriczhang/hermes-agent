@@ -325,17 +325,34 @@ class OpenVikingSkillSource(SkillSource):
     # ------------------------------------------------------------------
 
     def _list_dir(self, uri: str) -> List[Dict[str, Any]]:
-        """List immediate children of a viking://resources/... URI."""
-        # viking_browse on the plugin side hits /api/v1/content/list
-        # with action=list; do the same shape directly here so we don't
-        # depend on the tool dispatcher.
-        resp = self._client.post(
-            "/api/v1/content/list",
-            {"uri": uri.rstrip("/") + "/"},
+        """List immediate children of a viking://resources/... URI.
+
+        Uses the real OpenViking filesystem endpoint ``GET /api/v1/fs/ls``.
+        Entries are normalized to ``{"uri": ..., "is_dir": bool, "size": int}``
+        so the rest of this module is agnostic to OpenViking's field names
+        (it returns ``isDir`` and a flat ``result`` list).
+        """
+        resp = self._client.get(
+            "/api/v1/fs/ls",
+            params={"uri": uri.rstrip("/") + "/"},
         )
-        result = resp.get("result") or {}
-        entries = result.get("entries") or result.get("items") or []
-        return entries if isinstance(entries, list) else []
+        result = resp.get("result")
+        if isinstance(result, dict):
+            raw = result.get("entries") or result.get("items") or result.get("children") or []
+        elif isinstance(result, list):
+            raw = result
+        else:
+            raw = []
+        entries: List[Dict[str, Any]] = []
+        for e in raw:
+            if not isinstance(e, dict):
+                continue
+            entries.append({
+                "uri": e.get("uri", ""),
+                "is_dir": bool(e.get("isDir") or e.get("is_dir") or e.get("type") == "dir"),
+                "size": e.get("size", 0) or 0,
+            })
+        return entries
 
     def _read_description(self, base_uri: str) -> Optional[str]:
         """Fetch SKILL.md and pull ``description:`` out of the frontmatter.
@@ -356,8 +373,12 @@ class OpenVikingSkillSource(SkillSource):
     def _read_file(self, uri: str) -> Optional[str]:
         resp = self._client.get("/api/v1/content/read", params={"uri": uri})
         result = resp.get("result")
+        # OpenViking content/read returns the body as a plain string in
+        # ``result``; older shapes nested it under result.content.
+        if isinstance(result, str):
+            return result
         if isinstance(result, dict):
-            content = result.get("content")
+            content = result.get("content") or result.get("text")
             if isinstance(content, str):
                 return content
             if isinstance(content, (bytes, bytearray)):
@@ -365,8 +386,6 @@ class OpenVikingSkillSource(SkillSource):
                     return content.decode("utf-8")
                 except UnicodeDecodeError:
                     return None
-        if isinstance(result, str):
-            return result
         return None
 
     def _walk_tree(self, root_uri: str) -> Dict[str, Any]:
