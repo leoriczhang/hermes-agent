@@ -855,6 +855,25 @@ def init_agent(
                     headers["x-anthropic-beta"] = _FINE_GRAINED
                 client_kwargs["default_headers"] = headers
 
+        # When routing LLM traffic through a SkillClaw proxy, tag every
+        # request with the local user's identity so the proxy can attribute
+        # recorded sessions to the real team member instead of falling back
+        # to its own server-side $USER / sharing_user_alias.  Gated on the
+        # SkillClaw api-key prefix so the header never leaks to other
+        # providers (OpenAI, Anthropic, etc.).
+        _sc_key = str(client_kwargs.get("api_key", "") or "")
+        if _sc_key.startswith("skillclaw"):
+            _sc_user = (
+                os.environ.get("OPENVIKING_USER")
+                or os.environ.get("SKILLCLAW_USER")
+                or os.environ.get("USER")
+                or ""
+            ).strip()
+            if _sc_user:
+                _sc_headers = client_kwargs.get("default_headers") or {}
+                _sc_headers["X-Skillclaw-User"] = _sc_user
+                client_kwargs["default_headers"] = _sc_headers
+
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
         try:
