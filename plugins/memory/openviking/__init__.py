@@ -627,6 +627,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
         global _last_active_provider
         _last_active_provider = self
 
+    def _user_needs_onboarding(self) -> bool:
+        """Return True when the active user has no personal profile yet.
+
+        A brand-new teammate (fresh OPENVIKING_USER) starts with an empty
+        private namespace — no ``memories/profile.md``.  We use that as the
+        cold-start signal to trigger a one-time onboarding interview.  The
+        stat probe raises on NOT_FOUND, which is exactly the new-user case,
+        so a raised error maps to "needs onboarding".
+        """
+        if not self._client:
+            return False
+        profile_uri = f"viking://user/{self._user}/memories/profile.md"
+        try:
+            resp = self._client.get("/api/v1/fs/stat", params={"uri": profile_uri})
+        except Exception:
+            return True  # NOT_FOUND surfaces as RuntimeError -> needs onboarding
+        result = self._unwrap_result(resp)
+        # A clean stat response means the profile exists already.
+        return not bool(result)
+
     def system_prompt_block(self) -> str:
         if not self._client:
             return ""
@@ -650,6 +670,34 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     "to help the Cluster Curator optimize shared knowledge quality."
                 )
 
+            onboarding_section = ""
+            try:
+                if self._user_needs_onboarding():
+                    onboarding_section = (
+                        "\n\n## First-Run Onboarding (IMPORTANT — new teammate detected)\n"
+                        f"The current user (`{self._user}`) has no personal profile yet "
+                        "(empty private memory). At the very start of this session, before "
+                        "diving into their first task, run a brief, friendly cold-start interview:\n"
+                        "1. FIRST call `viking_search` with `scope=shared` for the team overview "
+                        "(try queries like \"团队介绍\" / \"team overview\" / \"start here\"). "
+                        "If results exist, give a 2-3 sentence summary of what this team does "
+                        "and what shared knowledge is available. If the team space is empty, skip this.\n"
+                        "2. THEN ask the user 2-4 light questions to get to know them: their name, "
+                        "their role/team, what they're working on, and any working preferences "
+                        "(language, tools, style). Ask conversationally, not as a rigid form — "
+                        "one short message, let them answer freely.\n"
+                        "3. AFTER they reply, persist what you learned with `viking_remember` "
+                        "into their PRIVATE space (`scope=private`): identity facts (name, role, "
+                        "team) as `category=entity`, working preferences (language, tools, style) "
+                        "as `category=preference`. The session will also auto-extract a "
+                        "`profile.md` on exit, so this onboarding only happens once.\n"
+                        "4. Keep it lightweight: if the user clearly just wants to start a task, "
+                        "do NOT block them — ask only the most essential questions (or just their "
+                        "name/role) and proceed. Never repeat onboarding once a profile exists.\n"
+                    )
+            except Exception as e:
+                logger.debug("OpenViking onboarding check failed: %s", e)
+
             return (
                 "# OpenViking Knowledge Base (Layered Memory)\n"
                 f"Active. Endpoint: {self._endpoint}\n\n"
@@ -672,6 +720,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "- `viking_feedback` — Provide feedback on a shared memory's usefulness (success/failure/partial)\n"
                 "- `viking_add_resource` — Ingest URLs/docs into the knowledge base"
                 + shared_section
+                + onboarding_section
             )
         except Exception as e:
             logger.warning("OpenViking system_prompt_block failed: %s", e)
@@ -706,15 +755,41 @@ class OpenVikingMemoryProvider(MemoryProvider):
                     self._endpoint, self._api_key,
                     account=self._account, user=self._user, agent=self._agent,
                 )
-                resp = client.post("/api/v1/search/find", {
-                    "query": query,
-                    "top_k": 5,
-                })
-                result = resp.get("result", {})
+                # Scope prefetch to the active user's private space + the
+                # team space (+ shared resources).  A ROOT key ignores the
+                # user header, so without an explicit per-namespace
+                # target_uri this would surface other teammates' private
+                # memories as "your" context.  Merge hits, best score wins.
+                merged: Dict[str, Dict[str, dict]] = {}
+                for target_uri in self._scoped_target_uris("all"):
+                    try:
+                        resp = client.post("/api/v1/search/find", {
+                            "query": query,
+                            "top_k": 5,
+                            "target_uri": target_uri,
+                        })
+                    except Exception as exc:
+                        logger.debug("OpenViking prefetch failed for %s: %s", target_uri, exc)
+                        continue
+                    sub = resp.get("result", {}) or {}
+                    for ctx_type in ("memories", "resources"):
+                        bucket = merged.setdefault(ctx_type, {})
+                        for item in sub.get(ctx_type, []) or []:
+                            uri = item.get("uri", "")
+                            if not uri:
+                                continue
+                            prev = bucket.get(uri)
+                            if prev is None or (item.get("score") or 0.0) > (prev.get("score") or 0.0):
+                                bucket[uri] = item
+                result = {ctx_type: list(items.values()) for ctx_type, items in merged.items()}
                 l0_parts = []
                 top_uri = ""
                 for ctx_type in ("memories", "resources"):
-                    items = result.get(ctx_type, [])
+                    items = sorted(
+                        result.get(ctx_type, []),
+                        key=lambda it: it.get("score") or 0.0,
+                        reverse=True,
+                    )
                     for item in items[:3]:
                         uri = item.get("uri", "")
                         abstract = item.get("abstract", "")
@@ -983,6 +1058,41 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return False
         return None
 
+    def _scoped_target_uris(self, scope: str) -> List[str]:
+        """Return the viking:// namespaces a search may touch for ``scope``.
+
+        With a ROOT API key, OpenViking's /search/find ignores the
+        X-OpenViking-User header and ranks across *every* user's private
+        memory — so an explicit ``target_uri`` per namespace is the only way
+        to keep one teammate from reading another's private memories.
+
+        Shared resources are deliberately limited to the *skills* trees.  The
+        raw ``sessions/`` logs under skillclaw also live in resources/ but
+        contain verbatim personal conversations (names, roles, private
+        context), so surfacing them to other teammates would re-introduce the
+        very cross-user leak we are guarding against.  Only the evolved skills
+        — which are sanitised, reusable knowledge — are team-shareable.
+        """
+        user_uri = f"viking://user/{self._user}/"
+        team_uri = f"viking://user/{self._team_user}/"
+        # Shared skill trees only — NOT raw session logs (see docstring).
+        # The skillclaw group path mirrors SKILLCLAW_VIKING_ROOT_PREFIX /
+        # SKILLCLAW_VIKING_GROUP_IDS so non-"team-a" deployments still work.
+        shared_resources = ["viking://resources/skills/"]
+        root_prefix = os.environ.get("SKILLCLAW_VIKING_ROOT_PREFIX", "skillclaw").strip("/")
+        group_ids = os.environ.get("SKILLCLAW_VIKING_GROUP_IDS", "").strip()
+        for gid in (g.strip() for g in group_ids.split(",")):
+            if gid:
+                shared_resources.append(
+                    f"viking://resources/{root_prefix}/{gid}/skills/"
+                )
+        if scope == "private":
+            return [user_uri] + shared_resources
+        if scope == "shared":
+            return [team_uri] + shared_resources
+        # "all" (default): personal + team + shared skills
+        return [user_uri, team_uri] + shared_resources
+
     def _tool_search(self, args: dict) -> str:
         query = args.get("query", "")
         if not query:
@@ -990,17 +1100,45 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         scope = args.get("scope", "all")
 
-        payload: Dict[str, Any] = {"query": query}
-        mode = args.get("mode", "auto")
-        if mode != "auto":
-            payload["mode"] = mode
-        if args.get("scope"):
-            payload["target_uri"] = args["scope"]
-        if args.get("limit"):
-            payload["top_k"] = args["limit"]
+        # An explicit viking:// URI in ``scope`` is treated as a literal
+        # target prefix (advanced/manual use); the enum values
+        # all/private/shared expand to the namespace allow-list instead.
+        raw_scope = str(args.get("scope") or "").strip()
+        if raw_scope.startswith("viking://"):
+            target_uris = [raw_scope]
+        else:
+            target_uris = self._scoped_target_uris(scope if scope in ("all", "private", "shared") else "all")
 
-        resp = self._client.post("/api/v1/search/find", payload)
-        result = resp.get("result", {})
+        mode = args.get("mode", "auto")
+        top_k = args.get("limit")
+
+        # Query each allowed namespace separately and merge — a single
+        # unscoped query would leak other users' private memories under a
+        # ROOT key.  De-duplicate merged hits by URI, keeping the best score.
+        merged: Dict[str, Dict[str, list]] = {}
+        for target_uri in target_uris:
+            payload: Dict[str, Any] = {"query": query, "target_uri": target_uri}
+            if mode != "auto":
+                payload["mode"] = mode
+            if top_k:
+                payload["top_k"] = top_k
+            try:
+                resp = self._client.post("/api/v1/search/find", payload)
+            except Exception as exc:
+                logger.debug("OpenViking search failed for %s: %s", target_uri, exc)
+                continue
+            sub = resp.get("result", {}) or {}
+            for ctx_type in ("memories", "resources", "skills"):
+                bucket = merged.setdefault(ctx_type, {})
+                for item in sub.get(ctx_type, []) or []:
+                    uri = item.get("uri", "")
+                    if not uri:
+                        continue
+                    prev = bucket.get(uri)
+                    if prev is None or (item.get("score") or 0.0) > (prev.get("score") or 0.0):
+                        bucket[uri] = item
+        result = {ctx_type: list(items.values()) for ctx_type, items in merged.items()}
+
 
         # Format results for the model — keep it concise, label with memory layer
         scored_entries = []
@@ -1038,24 +1176,23 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 scored_entries.append((sort_score, entry))
 
         scored_entries.sort(key=lambda x: x[0], reverse=True)
-        # Filter by scope if specified
-        if scope != "all":
-            filtered_entries = []
-            for sort_score, entry in scored_entries:
-                uri = entry.get("uri", "")
-                is_shared = f"/user/{self._team_user}/" in uri
-                if scope == "shared" and is_shared:
-                    filtered_entries.append((sort_score, entry))
-                elif scope == "private" and not is_shared:
-                    filtered_entries.append((sort_score, entry))
-            scored_entries = filtered_entries
+        # Scope is already enforced at query time via per-namespace
+        # target_uri (see _scoped_target_uris), so no post-filtering is
+        # needed here.
         # Filter out archived entries (redirect markers), deprioritize low-priority entries
         active_entries = []
         deprioritized_entries = []
         for sort_score, entry in scored_entries:
             uri = entry.get("uri", "")
             abstract = entry.get("abstract", "")
-            scope_label = "SHARED" if f"/user/{self._team_user}/" in uri else "PRIVATE"
+            # Team space and the shared resources/ tree are both team-wide;
+            # only viking://user/<other>/ would be private (and is already
+            # excluded by query-time scoping).
+            is_shared = (
+                f"/user/{self._team_user}/" in uri
+                or uri.startswith("viking://resources/")
+            )
+            scope_label = "SHARED" if is_shared else "PRIVATE"
             entry["scope"] = scope_label
             # Skip archived entries (redirect markers or _archived/ URIs)
             if "/_archived/" in uri or abstract.startswith("-> "):

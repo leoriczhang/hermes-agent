@@ -279,6 +279,13 @@ def _assistant_copy_text(content: Any) -> str:
 # Configuration Loading
 # =============================================================================
 
+# Sentinel prefix for the one-time onboarding bootstrap message that is
+# injected into the input queue at startup for brand-new users.  It carries
+# the cold-start instruction to the agent but is hidden from the chat preview
+# (the user only sees the agent's proactive greeting, not a fake message).
+_ONBOARDING_SEED_PREFIX = "\x00__HERMES_ONBOARDING_SEED__\x00"
+
+
 def _load_prefill_messages(file_path: str) -> List[Dict[str, Any]]:
     """Load ephemeral prefill messages from a JSON file.
     
@@ -12373,11 +12380,61 @@ class HermesCLI:
             ] if item is not None
         ]
 
+    def _maybe_seed_onboarding(self) -> None:
+        """Seed a hidden onboarding bootstrap message for brand-new users.
+
+        Fires only on a fresh (non-resumed) session when an OpenViking
+        memory provider reports the active user has no profile yet.  The
+        seeded message carries the ``_ONBOARDING_SEED_PREFIX`` sentinel so
+        process_loop strips it and suppresses the user-message preview — the
+        user simply sees the agent greet them and start a short interview.
+        Existing users (who already have a profile) are never bothered.
+
+        The agent itself is created lazily on the first chat turn, so we must
+        NOT rely on ``self.agent`` here (it is still None at startup).  We
+        construct a throwaway OpenViking provider purely to probe whether the
+        user needs onboarding.  Any failure is swallowed — onboarding is a
+        nice-to-have, never a hard requirement.
+        """
+        # Never interrupt a resumed conversation with an onboarding turn.
+        if getattr(self, "_resumed", False):
+            return
+        # OpenViking is the only provider that supports the cold-start probe.
+        if not os.environ.get("OPENVIKING_ENDPOINT"):
+            return
+        try:
+            from plugins.memory.openviking import OpenVikingMemoryProvider
+            provider = OpenVikingMemoryProvider()
+            provider.initialize(self.session_id)
+        except Exception as exc:
+            logger.debug("onboarding probe: provider init failed: %s", exc)
+            return
+        try:
+            needs = provider._user_needs_onboarding()
+        except Exception as exc:
+            logger.debug("onboarding probe: needs check failed: %s", exc)
+            return
+        finally:
+            try:
+                provider.shutdown()
+            except Exception:
+                pass
+        if not needs:
+            return
+        seed = (
+            _ONBOARDING_SEED_PREFIX
+            + "[系统] 这是一位新成员第一次使用，私有记忆为空。请主动开场："
+            "先用 viking_search（scope=shared）查团队概况并用两三句话介绍团队"
+            "（若团队空间为空则跳过介绍），然后友好地做一个简短的冷启动访谈，"
+            "了解 ta 的姓名、角色/团队、当前在做什么以及工作偏好。问得自然一些，"
+            "不要做成生硬的表单。等 ta 回答后，用 viking_remember（scope=private）"
+            "把了解到的信息存进私有空间。如果对方明显只想直接开始任务，就别拦着。"
+        )
+        self._pending_input.put(seed)
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         # Detect light/dark terminal mode now (before pt grabs the tty).
-        # Caches the result so subsequent _hex_to_ansi / style calls
-        # don't risk re-querying mid-render.
         try:
             _detect_light_mode()
         except Exception:
@@ -14373,8 +14430,21 @@ class HermesCLI:
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
-                    print()
-                    self._print_user_message_preview(user_input)
+
+                    # Onboarding seed: a hidden bootstrap message injected at
+                    # startup for brand-new users.  It drives the agent's
+                    # proactive cold-start interview, so we strip the sentinel
+                    # and skip the user-message preview — the user should only
+                    # see the agent greeting them, not a fake message they
+                    # never typed.
+                    _suppress_preview = False
+                    if isinstance(user_input, str) and user_input.startswith(_ONBOARDING_SEED_PREFIX):
+                        user_input = user_input[len(_ONBOARDING_SEED_PREFIX):]
+                        _suppress_preview = True
+
+                    if not _suppress_preview:
+                        print()
+                        self._print_user_message_preview(user_input)
                     
                     # Show image attachment count
                     if submit_images:
@@ -14438,7 +14508,16 @@ class HermesCLI:
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)
         process_thread.start()
-        
+
+        # Cold-start onboarding: for a brand-new user (no profile yet) seed a
+        # hidden bootstrap message so the agent proactively greets and runs a
+        # short interview.  Best-effort and only on fresh (non-resumed)
+        # sessions — never blocks startup.
+        try:
+            self._maybe_seed_onboarding()
+        except Exception as _onb_exc:
+            logger.debug("onboarding seed skipped: %s", _onb_exc)
+
         # Register atexit cleanup so resources are freed even on unexpected exit
         atexit.register(_run_cleanup)
         
