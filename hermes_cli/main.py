@@ -1732,9 +1732,14 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
+    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills).
+    # Skipped when skills.local_skills is off (the default): in the team setup
+    # all skills come from the server, so seeding the repo's bundled skills
+    # into ~/.hermes/skills/ would re-expose them and let them feed SkillClaw.
     try:
-        _sync_bundled_skills_for_startup()
+        from agent.skill_utils import local_skills_enabled
+        if local_skills_enabled():
+            _sync_bundled_skills_for_startup()
     except Exception:
         pass
 
@@ -1742,7 +1747,23 @@ def cmd_chat(args):
     # No-op unless OPENVIKING_ENDPOINT is set; never blocks startup on error.
     try:
         from tools.skills_hub import sync_team_skills
+        from hermes_cli.skills_hub import bootstrap_team_skills_if_empty
+        # First-run seed: if the team space is empty (and local bundled skills
+        # are disabled by default), publish the bundled skills to the server
+        # once so the user doesn't start with zero skills. No-op otherwise.
+        bootstrap_team_skills_if_empty(quiet=True)
         sync_team_skills(quiet=True)
+    except Exception:
+        pass
+
+    # Pull personal (Curator-managed) skills from the user's private
+    # OpenViking space (viking://user/<you>/skills/) so an agent's evolved
+    # skills follow the user across machines. Only fills in skills missing
+    # locally; marked created_by=agent so the Curator owns them. Distinct
+    # from team skills above (those are SkillClaw-managed, read-only locally).
+    try:
+        from tools.personal_skills_sync import pull_personal_skills
+        pull_personal_skills(quiet=True)
     except Exception:
         pass
 
@@ -12513,6 +12534,40 @@ Examples:
     )
     skills_publish.add_argument(
         "--repo", default="", help="Target GitHub repo (e.g. openai/skills)"
+    )
+
+    skills_publish_local = skills_subparsers.add_parser(
+        "publish-local",
+        help="Upload the bundled local skills to the team OpenViking server",
+        description=(
+            "Walk the repo's bundled skills/ tree and write each skill as a "
+            "directory under viking://resources/skills/<name>/ on the team "
+            "OpenViking server, so other Hermes instances pick them up via "
+            "sync_team_skills. Requires OPENVIKING_ENDPOINT to be set."
+        ),
+    )
+    skills_publish_local.add_argument(
+        "--name", default="", help="Publish only this skill (default: all bundled skills)"
+    )
+    skills_publish_local.add_argument(
+        "--force", action="store_true",
+        help="Overwrite existing server copies instead of skipping them",
+    )
+
+    skills_sync_personal = skills_subparsers.add_parser(
+        "sync-personal",
+        help="Sync personal (Curator-managed) skills with your private OpenViking space",
+        description=(
+            "Mirror personal skills between ~/.hermes/skills/ and your "
+            "private viking://user/<you>/skills/ space. Personal skills are "
+            "agent-created/evolved skills managed by the Curator and invisible "
+            "to SkillClaw (so they never feed team evolution). Requires "
+            "OPENVIKING_ENDPOINT and OPENVIKING_USER to be set."
+        ),
+    )
+    skills_sync_personal.add_argument(
+        "--direction", choices=["pull", "push", "both"], default="both",
+        help="pull (server->local), push (local->server), or both (default)",
     )
 
     skills_snapshot = skills_subparsers.add_parser(

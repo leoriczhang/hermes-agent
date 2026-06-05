@@ -20,6 +20,7 @@ from agent.skill_utils import (
     extract_skill_description,
     get_all_skills_dirs,
     get_disabled_skill_names,
+    get_excluded_local_skill_names,
     iter_skill_index_files,
     parse_frontmatter,
     skill_matches_platform,
@@ -1015,6 +1016,9 @@ def build_skills_system_prompt(
         or ""
     )
     disabled = get_disabled_skill_names()
+    # Bundled local skills to hide when skills.local_skills is off.  Part of
+    # the cache key so flipping the toggle invalidates the in-process cache.
+    excluded_local = get_excluded_local_skill_names()
     cache_key = (
         str(skills_dir.resolve()),
         tuple(str(d) for d in external_dirs),
@@ -1022,6 +1026,7 @@ def build_skills_system_prompt(
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,
         tuple(sorted(disabled)),
+        tuple(sorted(excluded_local)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1048,6 +1053,8 @@ def build_skills_system_prompt(
                 continue
             if frontmatter_name in disabled or skill_name in disabled:
                 continue
+            if frontmatter_name in excluded_local or skill_name in excluded_local:
+                continue
             if not _skill_should_show(
                 entry.get("conditions") or {},
                 available_tools,
@@ -1072,6 +1079,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if entry["frontmatter_name"] in excluded_local or skill_name in excluded_local:
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),

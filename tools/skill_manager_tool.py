@@ -883,6 +883,14 @@ def skill_manage(
             if action == "create":
                 if is_background_review():
                     mark_agent_created(name)
+                    # Mirror the freshly-evolved personal skill to the user's
+                    # private OpenViking space so it survives a machine swap.
+                    # Best-effort, env-gated; never breaks skill creation.
+                    try:
+                        from tools.personal_skills_sync import push_personal_skills
+                        push_personal_skills(quiet=True)
+                    except Exception:
+                        pass
             elif action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(name)
             elif action == "delete":

@@ -1535,6 +1535,17 @@ def run_curator_review(
 
         save_state(state2)
 
+        # Mirror the post-curation personal skill set to the user's private
+        # OpenViking space (viking://user/<you>/skills/) so evolved skills
+        # survive a machine swap. Best-effort, env-gated, never blocks the
+        # run. Skipped during dry-run (nothing changed) — see caller guard.
+        if not dry_run:
+            try:
+                from tools.personal_skills_sync import push_personal_skills
+                push_personal_skills(quiet=True)
+            except Exception as e:
+                logger.debug("Curator personal skill push failed: %s", e)
+
         if on_summary:
             try:
                 on_summary(f"curator: {final_summary}")

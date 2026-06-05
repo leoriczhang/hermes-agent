@@ -1377,6 +1377,17 @@ DEFAULT_CONFIG = {
     # Each path is expanded (~, ${VAR}) and resolved.  Read-only — skill creation
     # always goes to ~/.hermes/skills/.
     "skills": {
+        # Load the locally-bundled skills that ship with this Hermes
+        # checkout (the repo ``skills/`` tree synced into
+        # ``~/.hermes/skills/``).  OFF by default: in the team setup all
+        # skills come from the server (OpenViking / SkillClaw), and serving
+        # bundled local skills would let them feed SkillClaw evolution.
+        # When False, startup skips the bundled-skill sync AND every skill
+        # scanner (system prompt, /slash commands, skills_list) filters out
+        # any skill recorded in ~/.hermes/skills/.bundled_manifest — only
+        # OpenViking/team and hub-installed and agent-created skills remain.
+        # Set True to also use the local bundled skills.
+        "local_skills": False,
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
         # Substitute ${HERMES_SKILL_DIR} and ${HERMES_SESSION_ID} in SKILL.md
         # content with the absolute skill directory and the active session id

@@ -698,10 +698,28 @@ class OpenVikingMemoryProvider(MemoryProvider):
             except Exception as e:
                 logger.debug("OpenViking onboarding check failed: %s", e)
 
+            identity_section = (
+                "## Active User Identity (ground truth)\n"
+                f"You are talking to OpenViking user `{self._user}`. This is the "
+                "authoritative identity for THIS session, set from the environment — "
+                "NOT something to be inferred from search results.\n"
+                f"- This user's personal memory lives under `viking://user/{self._user}/`.\n"
+                f"- The shared team space is `viking://user/{self._team_user}/`.\n"
+                "- When the user asks about themselves (\"who am I\", \"我是谁\", their "
+                "name/role/preferences), answer ONLY from this user's OWN private space "
+                "(use `viking_search` with `scope=private`, or read "
+                f"`viking://user/{self._user}/memories/profile.md`). NEVER attribute "
+                "another teammate's profile, name, or facts to the current user, even if "
+                "such a result ranks highly in a broad search.\n"
+                "- If this user's private space has no identity info yet, say so and run "
+                "the onboarding interview below rather than guessing from team/other-user data.\n\n"
+            )
+
             return (
                 "# OpenViking Knowledge Base (Layered Memory)\n"
                 f"Active. Endpoint: {self._endpoint}\n\n"
-                "## Memory Layers\n"
+                + identity_section
+                + "## Memory Layers\n"
                 "- **L0 Context Memory** [PRIVATE] (~100 tokens): Auto-injected each turn via prefetch. "
                 "Quick abstracts of relevant knowledge. Use `viking_read level=abstract`.\n"
                 "- **L1 Stable Facts** [PRIVATE] (~2k tokens): User preferences, environment info, project facts. "
@@ -1066,19 +1084,21 @@ class OpenVikingMemoryProvider(MemoryProvider):
         memory — so an explicit ``target_uri`` per namespace is the only way
         to keep one teammate from reading another's private memories.
 
-        Shared resources are deliberately limited to the *skills* trees.  The
-        raw ``sessions/`` logs under skillclaw also live in resources/ but
-        contain verbatim personal conversations (names, roles, private
-        context), so surfacing them to other teammates would re-introduce the
-        very cross-user leak we are guarding against.  Only the evolved skills
-        — which are sanitised, reusable knowledge — are team-shareable.
+        Shared resources are deliberately limited to the SkillClaw-evolved
+        *skills* trees.  The raw ``sessions/`` logs under skillclaw also live
+        in resources/ but contain verbatim personal conversations (names,
+        roles, private context), so surfacing them to other teammates would
+        re-introduce the very cross-user leak we are guarding against.  Only
+        the evolved skills — sanitised, reusable knowledge — are shareable.
         """
         user_uri = f"viking://user/{self._user}/"
         team_uri = f"viking://user/{self._team_user}/"
         # Shared skill trees only — NOT raw session logs (see docstring).
-        # The skillclaw group path mirrors SKILLCLAW_VIKING_ROOT_PREFIX /
-        # SKILLCLAW_VIKING_GROUP_IDS so non-"team-a" deployments still work.
-        shared_resources = ["viking://resources/skills/"]
+        # Skills are published & versioned by SkillClaw's evolution pipeline
+        # under resources/<root_prefix>/<group_id>/skills/, mirroring
+        # SKILLCLAW_VIKING_ROOT_PREFIX / SKILLCLAW_VIKING_GROUP_IDS so
+        # non-"team-a" deployments still work.
+        shared_resources: List[str] = []
         root_prefix = os.environ.get("SKILLCLAW_VIKING_ROOT_PREFIX", "skillclaw").strip("/")
         group_ids = os.environ.get("SKILLCLAW_VIKING_GROUP_IDS", "").strip()
         for gid in (g.strip() for g in group_ids.split(",")):

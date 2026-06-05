@@ -271,8 +271,10 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     _skill_commands = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+        from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, get_excluded_local_skill_names
         disabled = _get_disabled_skill_names()
+        # Bundled local skills to hide when skills.local_skills is off.
+        excluded_local = get_excluded_local_skill_names()
         seen_names: set = set()
 
         # Scan local dir first, then external dirs
@@ -296,6 +298,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         continue
                     # Respect user's disabled skills config
                     if name in disabled:
+                        continue
+                    # Hide bundled local skills when local_skills is off.
+                    if name in excluded_local:
                         continue
                     description = frontmatter.get('description', '')
                     if not description:

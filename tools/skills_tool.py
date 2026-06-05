@@ -558,13 +558,17 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files, get_excluded_local_skill_names
 
     skills = []
     seen_names: set = set()
 
     # Load disabled set once (not per-skill)
     disabled = set() if skip_disabled else _get_disabled_skill_names()
+    # Bundled local skills to hide when skills.local_skills is off.  Honoured
+    # even when skip_disabled is set: the config UI still shouldn't surface
+    # bundled skills that won't load.
+    excluded_local = get_excluded_local_skill_names()
 
     # Scan local dir first, then external dirs (local takes precedence)
     dirs_to_scan = []
@@ -590,6 +594,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if name in seen_names:
                     continue
                 if name in disabled:
+                    continue
+                if name in excluded_local:
                     continue
 
                 description = frontmatter.get("description", "")

@@ -70,6 +70,49 @@ def _skillclaw_group_ids() -> List[str]:
 
 def _skillclaw_skill_prefix(group_id: str) -> str:
     return f"viking://resources/{_SKILLCLAW_ROOT_PREFIX}/{group_id}/skills/"
+
+
+def personal_skill_prefix() -> str:
+    """The per-user private skill namespace: ``viking://user/<you>/skills/``.
+
+    Personal skills are agent-created/evolved skills owned by a single user
+    and managed by the Hermes Curator (NOT SkillClaw).  They live in the
+    user's private OpenViking space (only that user can read them), so
+    SkillClaw — which only scans the shared ``resources/...`` skill trees —
+    never consumes them for team evolution.  Returns an empty string when
+    ``OPENVIKING_USER`` is unset (personal sync then becomes a no-op).
+    """
+    user = os.environ.get("OPENVIKING_USER", "").strip()
+    if not user:
+        return ""
+    return f"viking://user/{user}/skills/"
+
+
+# Skill ownership classes, decided purely by the server namespace prefix
+# (the user-confirmed source of truth for "personal" vs "team").
+SKILL_CLASS_PERSONAL = "personal"   # viking://user/<you>/skills/   — Curator-managed
+SKILL_CLASS_TEAM = "team"           # viking://resources/...        — SkillClaw-managed
+SKILL_CLASS_UNKNOWN = "unknown"
+
+
+def classify_skill_uri(uri: str) -> str:
+    """Classify a viking:// skill URI as personal, team, or unknown.
+
+    Personal  = the caller's private ``viking://user/<you>/skills/`` space
+                (managed by the Curator).
+    Team      = the shared ``viking://resources/skills/`` publish prefix and
+                every SkillClaw group prefix (managed by SkillClaw).
+    """
+    if not uri:
+        return SKILL_CLASS_UNKNOWN
+    personal = personal_skill_prefix()
+    if personal and uri.startswith(personal):
+        return SKILL_CLASS_PERSONAL
+    if _matching_skill_prefix(uri) is not None:
+        return SKILL_CLASS_TEAM
+    return SKILL_CLASS_UNKNOWN
+
+
 _SOURCE_ID = "openviking"
 # File extensions stored as decoded text in SkillBundle.files.  Anything
 # else stays as bytes so binary assets survive round-tripping.

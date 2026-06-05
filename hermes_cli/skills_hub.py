@@ -11,6 +11,7 @@ handler are thin wrappers that parse args and delegate.
 """
 
 import json
+import os
 import re
 import shutil
 from pathlib import Path
@@ -1151,6 +1152,232 @@ def do_publish(skill_path: str, target: str = "github", repo: str = "",
         c.print(f"[bold red]Unknown target:[/] {target}. Use 'github' or 'clawhub'.\n")
 
 
+def do_publish_local(name: str = "", force: bool = False,
+                     console: Optional[Console] = None) -> None:
+    """Upload the locally-bundled skills to the team's OpenViking server.
+
+    Walks the repo's bundled ``skills/`` tree and writes each skill as a
+    directory tree under ``viking://resources/skills/<name>/`` (the team
+    publish prefix that ``OpenVikingSkillSource`` reads back), so every
+    Hermes pointed at the same server can install them with
+    ``hermes skills install viking://resources/skills/<name>`` — and they
+    show up automatically via ``sync_team_skills`` at startup.
+
+    Args:
+        name: Publish only this skill (frontmatter name). Empty = all.
+        force: Overwrite an existing server copy (mode=update) instead of
+            skipping skills already present.
+    """
+    c = console or _console
+
+    from tools.skills_sync import _get_bundled_dir, _discover_bundled_skills
+    from tools.skills_hub_openviking_source import (
+        OpenVikingSkillSource,
+        _VIKING_SKILL_PREFIX,
+    )
+
+    if not os.environ.get("OPENVIKING_ENDPOINT"):
+        c.print("[bold red]Error:[/] OPENVIKING_ENDPOINT is not set — "
+                "cannot reach the team server.\n")
+        return
+
+    client = OpenVikingSkillSource._build_client()
+    if client is None:
+        c.print("[bold red]Error:[/] Could not build an OpenViking client. "
+                "Check OPENVIKING_ENDPOINT / OPENVIKING_API_KEY in "
+                f"{display_hermes_home()}/.env.\n")
+        return
+
+    bundled_dir = _get_bundled_dir()
+    bundled = _discover_bundled_skills(bundled_dir)
+    if name:
+        bundled = [(n, p) for (n, p) in bundled if n == name]
+        if not bundled:
+            c.print(f"[bold red]Error:[/] No bundled skill named '{name}'.\n")
+            return
+
+    c.print(f"[bold]Publishing {len(bundled)} local skill(s) to "
+            f"{_VIKING_SKILL_PREFIX}...[/]")
+
+    published, skipped, failed = _publish_bundled_skills(
+        client, bundled, force=force, emit=c.print,
+    )
+
+    c.print(f"\n[bold green]Done:[/] {published} published, "
+            f"{skipped} skipped, {failed} failed.\n")
+
+
+def _publish_bundled_skills(client, bundled, *, force: bool,
+                            emit=lambda _m: None):
+    """Upload bundled skill trees to ``viking://resources/skills/<name>/``.
+
+    Shared by ``do_publish_local`` (CLI) and ``bootstrap_team_skills_if_empty``
+    (quiet first-run seed). ``emit`` receives human-readable progress lines.
+    Returns ``(published, skipped, failed)``.
+    """
+    from tools.skills_hub_openviking_source import _VIKING_SKILL_PREFIX
+
+    published = 0
+    skipped = 0
+    failed = 0
+    for skill_name, skill_dir in bundled:
+        base_uri = f"{_VIKING_SKILL_PREFIX}{skill_name}"
+
+        # Skip if already on the server unless --force.
+        if not force:
+            try:
+                existing = client.get(
+                    "/api/v1/content/read",
+                    params={"uri": f"{base_uri}/SKILL.md"},
+                )
+                if existing.get("result"):
+                    emit(f"  = {skill_name} (already on server, skipping)")
+                    skipped += 1
+                    continue
+            except Exception:
+                pass  # not present -> publish it
+
+        mode = "update" if force else "create"
+        ok = True
+        for file_path in sorted(skill_dir.rglob("*")):
+            if not file_path.is_file() or file_path.is_symlink():
+                continue
+            if is_excluded_skill_path(file_path):
+                continue
+            rel = file_path.relative_to(skill_dir).as_posix()
+            try:
+                content = file_path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError) as e:
+                emit(f"  ! {skill_name}/{rel}: cannot read ({e})")
+                ok = False
+                break
+            file_uri = f"{base_uri}/{rel}"
+            try:
+                client.post("/api/v1/content/write", {
+                    "uri": file_uri,
+                    "content": content,
+                    "mode": mode,
+                })
+            except Exception as e:
+                # In create mode a pre-existing file errors — retry as update.
+                try:
+                    client.post("/api/v1/content/write", {
+                        "uri": file_uri,
+                        "content": content,
+                        "mode": "update",
+                    })
+                except Exception as e2:
+                    emit(f"  ! {skill_name}/{rel}: write failed ({e2 or e})")
+                    ok = False
+                    break
+
+        if ok:
+            emit(f"  + {skill_name}")
+            published += 1
+        else:
+            failed += 1
+
+    return published, skipped, failed
+
+
+def bootstrap_team_skills_if_empty(quiet: bool = True) -> int:
+    """First-run seed: publish bundled skills to the team space if it's empty.
+
+    When a fresh team server has NO team skills yet (and local bundled skills
+    are disabled by default), a user would otherwise start with zero skills.
+    This detects that case and uploads the local bundled skills to
+    ``viking://resources/skills/`` once, so this and every other Hermes on the
+    account gets a base skill set (caller then re-runs ``sync_team_skills`` to
+    install them locally).
+
+    No-op (returns 0) unless OPENVIKING_ENDPOINT is set, a client can be
+    built, AND the server reports zero team skills. Never raises.
+
+    Returns the number of skills published.
+    """
+    if not os.environ.get("OPENVIKING_ENDPOINT"):
+        return 0
+    try:
+        from tools.skills_sync import _get_bundled_dir, _discover_bundled_skills
+        from tools.skills_hub_openviking_source import OpenVikingSkillSource
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Skill bootstrap unavailable: %s", exc)
+        return 0
+
+    try:
+        source = OpenVikingSkillSource()
+    except Exception as exc:
+        logger.debug("Skill bootstrap: could not build source: %s", exc)
+        return 0
+    if source._client is None:
+        return 0
+
+    # Only seed when the team space is genuinely empty — never clobber an
+    # already-populated server.
+    try:
+        if source.search("", limit=1):
+            return 0
+    except Exception as exc:
+        logger.debug("Skill bootstrap: emptiness check failed: %s", exc)
+        return 0
+
+    bundled = _discover_bundled_skills(_get_bundled_dir())
+    if not bundled:
+        return 0
+
+    if not quiet:
+        logger.info("No team skills on server — seeding %d bundled skill(s).",
+                    len(bundled))
+    published, _skipped, _failed = _publish_bundled_skills(
+        source._client, bundled, force=False,
+    )
+    return published
+
+
+def do_sync_personal(direction: str = "both",
+                     console: Optional[Console] = None) -> None:
+    """Sync personal (Curator-managed) skills with the user's private space.
+
+    Personal skills live under ``viking://user/<you>/skills/`` — owned by one
+    user, managed by the Curator, and invisible to SkillClaw (so they never
+    feed team evolution).  This mirrors them between the local
+    ``~/.hermes/skills/`` set and the server.
+
+    Args:
+        direction: ``pull`` (server -> local, fill missing only),
+            ``push`` (local agent-created -> server), or ``both`` (pull
+            then push; the default).
+    """
+    c = console or _console
+
+    if not os.environ.get("OPENVIKING_ENDPOINT"):
+        c.print("[bold red]Error:[/] OPENVIKING_ENDPOINT is not set — "
+                "cannot reach the server.\n")
+        return
+    if not os.environ.get("OPENVIKING_USER"):
+        c.print("[bold red]Error:[/] OPENVIKING_USER is not set — personal "
+                "skills are keyed to your user namespace.\n")
+        return
+
+    from tools.personal_skills_sync import (
+        pull_personal_skills,
+        push_personal_skills,
+    )
+    from tools.skills_hub_openviking_source import personal_skill_prefix
+
+    c.print(f"[bold]Syncing personal skills with {personal_skill_prefix()}[/]")
+
+    if direction in ("pull", "both"):
+        r = pull_personal_skills(quiet=False)
+        c.print(f"  pull: {r['pulled']} pulled, {r['skipped']} skipped, "
+                f"{r['failed']} failed (of {r['total']})")
+    if direction in ("push", "both"):
+        r = push_personal_skills(quiet=False)
+        c.print(f"  push: {r['pushed']} pushed, {r['failed']} failed "
+                f"(of {r['total']})")
+    c.print("[bold green]Done.[/]\n")
+
+
 def _github_publish(skill_path: Path, skill_name: str, target_repo: str,
                     auth) -> tuple:
     """Create a PR to a GitHub repo with the skill. Returns (success, message)."""
@@ -1376,6 +1603,13 @@ def skills_command(args) -> None:
             target=getattr(args, "to", "github"),
             repo=getattr(args, "repo", ""),
         )
+    elif action == "publish-local":
+        do_publish_local(
+            name=getattr(args, "name", "") or "",
+            force=getattr(args, "force", False),
+        )
+    elif action == "sync-personal":
+        do_sync_personal(direction=getattr(args, "direction", "both") or "both")
     elif action == "snapshot":
         snap_action = getattr(args, "snapshot_action", None)
         if snap_action == "export":
@@ -1392,7 +1626,7 @@ def skills_command(args) -> None:
             return
         do_tap(tap_action, repo=repo)
     else:
-        _console.print("Usage: hermes skills [browse|search|install|inspect|list|check|update|audit|uninstall|reset|publish|snapshot|tap]\n")
+        _console.print("Usage: hermes skills [browse|search|install|inspect|list|check|update|audit|uninstall|reset|publish|publish-local|sync-personal|snapshot|tap]\n")
         _console.print("Run 'hermes skills <command> --help' for details.\n")
 
 
@@ -1572,6 +1806,22 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
             if a == "--repo" and i + 1 < len(args):
                 repo = args[i + 1]
         do_publish(skill_path, target=target, repo=repo, console=c)
+
+    elif action == "publish-local":
+        name = ""
+        force = "--force" in args
+        for i, a in enumerate(args):
+            if a == "--name" and i + 1 < len(args):
+                name = args[i + 1]
+        do_publish_local(name=name, force=force, console=c)
+
+    elif action == "sync-personal":
+        direction = "both"
+        for d in ("pull", "push", "both"):
+            if d in args:
+                direction = d
+                break
+        do_sync_personal(direction=direction, console=c)
 
     elif action == "snapshot":
         if not args:

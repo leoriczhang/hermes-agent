@@ -222,6 +222,65 @@ def _normalize_string_set(values) -> Set[str]:
     return {str(v).strip() for v in values if str(v).strip()}
 
 
+# ── Local (bundled) skills toggle ─────────────────────────────────────────
+
+
+def local_skills_enabled() -> bool:
+    """Return whether locally-bundled skills should be served.
+
+    Reads ``skills.local_skills`` from config.yaml (default False).  When
+    False the team setup serves *only* server-sourced skills (OpenViking /
+    SkillClaw), and the bundled skills shipped with this checkout are
+    hidden from every skill scanner so they cannot feed SkillClaw
+    evolution.
+
+    Reads the config file directly (no CLI config imports) to stay
+    lightweight, mirroring ``get_disabled_skill_names``.
+    """
+    config_path = get_config_path()
+    if not config_path.exists():
+        return False
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.debug("Could not read skill config %s: %s", config_path, e)
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return False
+    return bool(skills_cfg.get("local_skills", False))
+
+
+def get_excluded_local_skill_names() -> Set[str]:
+    """Return bundled skill names to hide when local skills are disabled.
+
+    Empty set when ``skills.local_skills`` is True (everything is allowed)
+    or when the bundled manifest is missing.  Otherwise returns the names
+    recorded in ``~/.hermes/skills/.bundled_manifest`` so the three skill
+    scanners can filter out repo-shipped skills while keeping
+    OpenViking/team, hub-installed, and agent-created skills.
+    """
+    if local_skills_enabled():
+        return set()
+    manifest = get_skills_dir() / ".bundled_manifest"
+    if not manifest.exists():
+        return set()
+    names: Set[str] = set()
+    try:
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            name = line.split(":", 1)[0].strip()
+            if name:
+                names.add(name)
+    except OSError as e:
+        logger.debug("Failed to read bundled manifest: %s", e)
+    return names
+
+
 # ── External skills directories ──────────────────────────────────────────
 
 # (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
