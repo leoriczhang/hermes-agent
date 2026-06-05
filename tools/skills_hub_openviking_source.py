@@ -171,12 +171,20 @@ def _normalize_identifier(identifier: str) -> str:
 
 
 def _slug_from_uri(uri: str) -> str:
-    """``viking://resources/.../skills/flight-search/`` -> ``flight-search``."""
+    """Skill slug = the skill's own directory name.
+
+    Handles both the flat layout
+    (``viking://resources/skills/flight-search`` -> ``flight-search``) and
+    the categorised layout
+    (``viking://resources/skills/travel/flight-search`` ->
+    ``flight-search``).  The slug is always the LAST path segment under the
+    skill prefix because that's the directory that actually holds SKILL.md.
+    """
     prefix = _matching_skill_prefix(uri)
     if not prefix:
         return ""
     rest = uri[len(prefix) :].rstrip("/")
-    return rest.split("/")[0] if rest else ""
+    return rest.split("/")[-1] if rest else ""
 
 
 class OpenVikingSkillSource(SkillSource):
@@ -228,12 +236,50 @@ class OpenVikingSkillSource(SkillSource):
         # Hermes' bundled review.  ``team`` is recognised in the hub UI.
         return "team"
 
+    def _iter_skill_uris(self, prefix: str) -> List[str]:
+        """Yield every skill-bundle URI under ``prefix``.
+
+        Supports both layouts simultaneously:
+          - flat:       ``<prefix>/<skill>/SKILL.md``
+          - categorised:``<prefix>/<category>/<skill>/SKILL.md``
+
+        An immediate child directory that holds a SKILL.md is itself a skill;
+        otherwise it's treated as a category and its child directories are
+        listed as skills.  SkillClaw evolution prefixes stay flat, so they
+        just hit the first branch.
+        """
+        skill_uris: List[str] = []
+        try:
+            top = self._list_dir(prefix)
+        except Exception as exc:
+            logger.debug("OpenViking skill listing failed for %s: %s", prefix, exc)
+            return skill_uris
+        for entry in top:
+            uri = (entry.get("uri") or "").rstrip("/")
+            if not uri.startswith(prefix) or not entry.get("is_dir", False):
+                continue
+            if self._read_file(f"{uri}/SKILL.md") is not None:
+                skill_uris.append(uri)
+                continue
+            # No SKILL.md here -> treat as a category dir, descend one level.
+            try:
+                children = self._list_dir(uri)
+            except Exception:
+                continue
+            for child in children:
+                child_uri = (child.get("uri") or "").rstrip("/")
+                if not child_uri.startswith(uri) or not child.get("is_dir", False):
+                    continue
+                if self._read_file(f"{child_uri}/SKILL.md") is not None:
+                    skill_uris.append(child_uri)
+        return skill_uris
+
     def search(self, query: str, limit: int = 10) -> List[SkillMeta]:
         """List published skills under all configured skill prefixes.
 
         Filters by ``query`` substring against the slug (case-insensitive).
-        Uses viking_browse (``/api/v1/content/list``) rather than memory
-        search because resources don't get embedded into the memory index.
+        Handles both the flat ``<prefix>/<skill>`` and categorised
+        ``<prefix>/<category>/<skill>`` server layouts.
         """
         if self._client is None:
             return []
@@ -241,17 +287,9 @@ class OpenVikingSkillSource(SkillSource):
         results: List[SkillMeta] = []
         seen_names: set[str] = set()
         for prefix in _all_skill_prefixes():
-            try:
-                entries = self._list_dir(prefix)
-            except Exception as exc:
-                logger.debug("OpenViking skill listing failed for %s: %s", prefix, exc)
-                continue
-            for entry in entries:
-                uri = entry.get("uri") or ""
-                if not uri.startswith(prefix):
-                    continue
+            for uri in self._iter_skill_uris(prefix):
                 name = _slug_from_uri(uri)
-                if not name or not entry.get("is_dir", False):
+                if not name:
                     continue
                 if q and q not in name.lower():
                     continue
@@ -300,9 +338,14 @@ class OpenVikingSkillSource(SkillSource):
         if not name:
             return None
         for prefix in _all_skill_prefixes():
+            # Flat layout: <prefix>/<name>/SKILL.md
             candidate = f"{prefix}{name}"
             if self._read_file(f"{candidate}/SKILL.md") is not None:
                 return candidate
+            # Categorised layout: <prefix>/<category>/<name>/SKILL.md
+            for skill_uri in self._iter_skill_uris(prefix):
+                if _slug_from_uri(skill_uri) == name:
+                    return skill_uri
         return None
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:

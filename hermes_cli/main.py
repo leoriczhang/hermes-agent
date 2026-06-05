@@ -1762,7 +1762,14 @@ def cmd_chat(args):
     # locally; marked created_by=agent so the Curator owns them. Distinct
     # from team skills above (those are SkillClaw-managed, read-only locally).
     try:
-        from tools.personal_skills_sync import pull_personal_skills
+        from tools.personal_skills_sync import (
+            fork_team_skills_to_personal_if_empty,
+            pull_personal_skills,
+        )
+        # First-run seed: if this user has no personal skills yet, fork the
+        # team publish skills into their private space so they start with a
+        # base set as their own (Curator-managed) skills. No-op otherwise.
+        fork_team_skills_to_personal_if_empty(quiet=True)
         pull_personal_skills(quiet=True)
     except Exception:
         pass

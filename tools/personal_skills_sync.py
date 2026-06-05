@@ -96,6 +96,41 @@ def _read_file(client: Any, uri: str) -> Optional[str]:
     return None
 
 
+def _iter_skill_dirs(client: Any, prefix: str) -> List[Tuple[str, str]]:
+    """Discover skill bundles under ``prefix``, flat OR one level nested.
+
+    Returns ``(rel_path, skill_uri)`` pairs where ``rel_path`` is the skill's
+    path relative to ``prefix`` — either ``<name>`` (flat) or
+    ``<category>/<name>`` (categorised).  A directory holding a SKILL.md is a
+    skill; one without is treated as a category and descended one level.
+    """
+    prefix = prefix.rstrip("/") + "/"
+    out: List[Tuple[str, str]] = []
+    try:
+        top = _list_dir(client, prefix)
+    except Exception as exc:
+        logger.debug("skill listing failed for %s: %s", prefix, exc)
+        return out
+    for entry in top:
+        uri = (entry.get("uri") or "").rstrip("/")
+        if not entry.get("is_dir") or not uri.startswith(prefix):
+            continue
+        if _read_file(client, f"{uri}/SKILL.md") is not None:
+            out.append((uri[len(prefix):], uri))
+            continue
+        try:
+            children = _list_dir(client, uri)
+        except Exception:
+            continue
+        for child in children:
+            child_uri = (child.get("uri") or "").rstrip("/")
+            if not child.get("is_dir") or not child_uri.startswith(uri):
+                continue
+            if _read_file(client, f"{child_uri}/SKILL.md") is not None:
+                out.append((child_uri[len(prefix):], child_uri))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Pull — server -> local (startup)
 # ---------------------------------------------------------------------------
@@ -125,7 +160,7 @@ def pull_personal_skills(quiet: bool = True) -> Dict[str, int]:
         return counts
 
     try:
-        entries = _list_dir(client, prefix)
+        skill_dirs = _iter_skill_dirs(client, prefix)
     except Exception as exc:
         logger.debug("personal skill listing failed: %s", exc)
         return counts
@@ -142,17 +177,16 @@ def pull_personal_skills(quiet: bool = True) -> Dict[str, int]:
         off_limits = set()
         mark_agent_created = None  # type: ignore
 
-    for entry in entries:
-        uri = entry.get("uri") or ""
-        if not entry.get("is_dir") or not uri.startswith(prefix):
-            continue
-        name = uri[len(prefix):].rstrip("/").split("/")[0]
+    for rel_path, uri in skill_dirs:
+        name = rel_path.rstrip("/").split("/")[-1]
         if not name:
             continue
         counts["total"] += 1
 
         # Never clobber a same-named local skill (incl. bundled/hub/local).
-        if name in off_limits or (base / name).exists():
+        # Match by skill name anywhere in the local tree, not just base/name,
+        # so the categorised local layout is respected.
+        if name in off_limits or _local_skill_exists(base, name):
             counts["skipped"] += 1
             continue
 
@@ -166,8 +200,10 @@ def pull_personal_skills(quiet: bool = True) -> Dict[str, int]:
             counts["skipped"] += 1
             continue
 
+        # Preserve the server's category layout locally (rel_path may be
+        # ``<category>/<name>``).
         try:
-            _write_local_skill(base / name, files)
+            _write_local_skill(base / rel_path, files)
             if mark_agent_created is not None:
                 mark_agent_created(name)
             counts["pulled"] += 1
@@ -213,6 +249,97 @@ def _write_local_skill(skill_dir: Path, files: Dict[str, str]) -> None:
             target.write_bytes(content)
         else:
             target.write_text(content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Fork — seed an empty personal space from the team publish skills
+# ---------------------------------------------------------------------------
+
+def fork_team_skills_to_personal_if_empty(quiet: bool = True) -> Dict[str, int]:
+    """Seed an empty personal space by forking the team publish skills.
+
+    When a user has NO personal skills yet (``viking://user/<you>/skills/``
+    is empty/absent), copy the team publish skills from
+    ``viking://resources/skills/`` into the user's private space so a fresh
+    user starts with the base skill set as their own (Curator-managed)
+    skills. Only the publish prefix is forked — SkillClaw's evolution space
+    is intentionally left alone.
+
+    No-op (all zeros) unless OPENVIKING_ENDPOINT + OPENVIKING_USER are set,
+    the personal space is empty, AND the team publish space has skills.
+    Never raises.
+
+    Returns ``{"forked": int, "skipped": int, "failed": int, "total": int}``.
+    """
+    counts = {"forked": 0, "skipped": 0, "failed": 0, "total": 0}
+    if not os.environ.get("OPENVIKING_ENDPOINT"):
+        return counts
+
+    from tools.skills_hub_openviking_source import (
+        personal_skill_prefix,
+        _VIKING_SKILL_PREFIX,
+    )
+    personal_prefix = personal_skill_prefix()
+    if not personal_prefix:
+        return counts
+
+    client = _build_client()
+    if client is None:
+        return counts
+
+    # Only fork into a genuinely empty personal space.
+    try:
+        existing_personal = _list_dir(client, personal_prefix)
+    except Exception as exc:
+        if not _is_not_found(exc):
+            logger.debug("Fork: personal space check failed: %s", exc)
+            return counts
+        existing_personal = []
+    if existing_personal:
+        return counts
+
+    # Source = the team publish skills (NOT the SkillClaw evolution space).
+    try:
+        team_skills = _iter_skill_dirs(client, _VIKING_SKILL_PREFIX)
+    except Exception as exc:
+        if not _is_not_found(exc):
+            logger.debug("Fork: team publish listing failed: %s", exc)
+        return counts
+
+    for rel_path, uri in team_skills:
+        if not rel_path:
+            continue
+        counts["total"] += 1
+        try:
+            files = _walk_tree(client, uri.rstrip("/"))
+        except Exception as exc:
+            logger.debug("Fork: walk failed for %s: %s", uri, exc)
+            counts["failed"] += 1
+            continue
+        if not files or "SKILL.md" not in files:
+            counts["skipped"] += 1
+            continue
+        # Mirror the team's category layout into the personal space.
+        dest_base = f"{personal_prefix}{rel_path}"
+        ok = True
+        for rel, content in files.items():
+            if not _write_remote(client, f"{dest_base}/{rel}", content):
+                ok = False
+                break
+        if ok:
+            counts["forked"] += 1
+        else:
+            counts["failed"] += 1
+
+    if not quiet and counts["forked"]:
+        logger.info("Forked %d team skill(s) into personal space",
+                    counts["forked"])
+    return counts
+
+
+def _is_not_found(exc: Exception) -> bool:
+    s = str(exc)
+    return "NOT_FOUND" in s or "not found" in s.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +389,14 @@ def push_personal_skills(quiet: bool = True) -> Dict[str, int]:
                 continue
             skill_dir = located
         counts["total"] += 1
-        base_uri = f"{prefix}{name}"
+        # Mirror the local category layout into the personal space: the path
+        # under the prefix is the skill dir relative to the local skills root
+        # (``<category>/<name>``), falling back to a flat ``<name>``.
+        try:
+            rel_base = skill_dir.relative_to(base).as_posix()
+        except ValueError:
+            rel_base = name
+        base_uri = f"{prefix}{rel_base}"
         ok = True
         for file_path in sorted(skill_dir.rglob("*")):
             if not file_path.is_file() or file_path.is_symlink():
@@ -299,16 +433,34 @@ def _locate_skill_dir(base: Path, name: str) -> Optional[Path]:
     return None
 
 
+def _local_skill_exists(base: Path, name: str) -> bool:
+    """True if a skill called *name* already exists locally (flat or nested)."""
+    if (base / name / "SKILL.md").exists():
+        return True
+    return _locate_skill_dir(base, name) is not None
+
+
 def _write_remote(client: Any, uri: str, content: str) -> bool:
-    """Write one file to OpenViking, creating or updating as needed."""
-    for mode in ("update", "create"):
-        try:
-            client.post("/api/v1/content/write", {
-                "uri": uri,
-                "content": content,
-                "mode": mode,
-            })
-            return True
-        except Exception as exc:
-            logger.debug("content/write %s (%s) failed: %s", uri, mode, exc)
-    return False
+    """Write one file to OpenViking (create-only server).
+
+    This OpenViking build only supports ``mode="create"`` and enforces a
+    file-extension allow-list. Returns True when the file is on the server
+    afterwards: a successful create, an already-present file, or a
+    blocked-extension file are all treated as non-fatal (the latter two
+    aren't errors we can fix here). Returns False only on a real write error.
+    """
+    try:
+        client.post("/api/v1/content/write", {
+            "uri": uri,
+            "content": content,
+            "mode": "create",
+        })
+        return True
+    except Exception as exc:
+        msg = str(exc)
+        if "ALREADY_EXISTS" in msg or "already exists" in msg.lower():
+            return True  # create-only server, file already there
+        if "does not allow extension" in msg:
+            return True  # server extension allow-list — skip, don't fail
+        logger.debug("content/write %s failed: %s", uri, exc)
+        return False

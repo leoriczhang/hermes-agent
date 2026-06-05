@@ -1209,21 +1209,50 @@ def do_publish_local(name: str = "", force: bool = False,
 
 def _publish_bundled_skills(client, bundled, *, force: bool,
                             emit=lambda _m: None):
-    """Upload bundled skill trees to ``viking://resources/skills/<name>/``.
+    """Upload bundled skill trees to ``viking://resources/skills/<cat>/<name>/``.
 
     Shared by ``do_publish_local`` (CLI) and ``bootstrap_team_skills_if_empty``
     (quiet first-run seed). ``emit`` receives human-readable progress lines.
-    Returns ``(published, skipped, failed)``.
+
+    The bundled ``skills/`` tree is organised into category folders
+    (``skills/github/github-auth``, ``skills/productivity/notion`` ...).  That
+    category structure is mirrored on the server so the published layout
+    matches the local one — the OpenViking loader resolves a skill by its own
+    directory name regardless of the category prefix above it.
+
+    Notes on server limits (this OpenViking build):
+      - ``content/write`` only supports ``mode="create"`` — there is no
+        update/overwrite. So an already-present skill is skipped wholesale
+        (the per-skill SKILL.md probe below); ``force`` cannot overwrite.
+      - ``create`` enforces a file-extension allow-list (md/txt/py/json/
+        yaml/yml/toml/js/ts ...). Files with a blocked extension (.sh, .tex,
+        .png, ...) are SKIPPED with a warning rather than failing the whole
+        skill — the skill's core (SKILL.md + scripts in allowed formats)
+        still publishes.
+
+    Returns ``(published, skipped, failed)`` (skill-level counts).
     """
     from tools.skills_hub_openviking_source import _VIKING_SKILL_PREFIX
+    from tools.skills_sync import _get_bundled_dir
+
+    bundled_dir = _get_bundled_dir()
 
     published = 0
     skipped = 0
     failed = 0
+    skipped_files = 0
     for skill_name, skill_dir in bundled:
-        base_uri = f"{_VIKING_SKILL_PREFIX}{skill_name}"
+        # Mirror the local category layout on the server: the path under the
+        # publish prefix is the skill dir relative to the bundled root
+        # (e.g. ``github/github-auth``).  Skills sitting directly at the root
+        # publish flat (``<name>``) — the loader handles both.
+        try:
+            rel_base = Path(skill_dir).relative_to(bundled_dir).as_posix()
+        except ValueError:
+            rel_base = skill_name
+        base_uri = f"{_VIKING_SKILL_PREFIX}{rel_base}"
 
-        # Skip if already on the server unless --force.
+        # Skip if already on the server (no overwrite — server lacks update).
         if not force:
             try:
                 existing = client.get(
@@ -1237,7 +1266,6 @@ def _publish_bundled_skills(client, bundled, *, force: bool,
             except Exception:
                 pass  # not present -> publish it
 
-        mode = "update" if force else "create"
         ok = True
         for file_path in sorted(skill_dir.rglob("*")):
             if not file_path.is_file() or file_path.is_symlink():
@@ -1247,29 +1275,32 @@ def _publish_bundled_skills(client, bundled, *, force: bool,
             rel = file_path.relative_to(skill_dir).as_posix()
             try:
                 content = file_path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError) as e:
-                emit(f"  ! {skill_name}/{rel}: cannot read ({e})")
-                ok = False
-                break
+            except (UnicodeDecodeError, OSError):
+                # Non-text / unreadable file — server allow-list is text-only,
+                # so skip it instead of failing the whole skill.
+                emit(f"  ~ {skill_name}/{rel}: skipped (binary/unreadable)")
+                skipped_files += 1
+                continue
             file_uri = f"{base_uri}/{rel}"
             try:
                 client.post("/api/v1/content/write", {
                     "uri": file_uri,
                     "content": content,
-                    "mode": mode,
+                    "mode": "create",
                 })
             except Exception as e:
-                # In create mode a pre-existing file errors — retry as update.
-                try:
-                    client.post("/api/v1/content/write", {
-                        "uri": file_uri,
-                        "content": content,
-                        "mode": "update",
-                    })
-                except Exception as e2:
-                    emit(f"  ! {skill_name}/{rel}: write failed ({e2 or e})")
-                    ok = False
-                    break
+                msg = str(e)
+                if "does not allow extension" in msg:
+                    # Server-side extension allow-list — skip this file only.
+                    emit(f"  ~ {skill_name}/{rel}: skipped (extension blocked by server)")
+                    skipped_files += 1
+                    continue
+                if "ALREADY_EXISTS" in msg or "already exists" in msg.lower():
+                    # File already on server (no update mode) — leave as-is.
+                    continue
+                emit(f"  ! {skill_name}/{rel}: write failed ({msg})")
+                ok = False
+                break
 
         if ok:
             emit(f"  + {skill_name}")
@@ -1277,21 +1308,28 @@ def _publish_bundled_skills(client, bundled, *, force: bool,
         else:
             failed += 1
 
+    if skipped_files:
+        emit(f"  ({skipped_files} file(s) skipped due to server limits)")
     return published, skipped, failed
 
 
 def bootstrap_team_skills_if_empty(quiet: bool = True) -> int:
-    """First-run seed: publish bundled skills to the team space if it's empty.
+    """First-run seed: publish bundled skills if the publish space is empty.
 
-    When a fresh team server has NO team skills yet (and local bundled skills
-    are disabled by default), a user would otherwise start with zero skills.
-    This detects that case and uploads the local bundled skills to
-    ``viking://resources/skills/`` once, so this and every other Hermes on the
-    account gets a base skill set (caller then re-runs ``sync_team_skills`` to
-    install them locally).
+    When the team publish prefix ``viking://resources/skills/`` holds NO
+    skills yet (and local bundled skills are disabled by default), a user
+    would otherwise start with no base skill set. This detects that case and
+    uploads the local bundled skills there once, so this and every other
+    Hermes on the account gets a base skill set (caller then re-runs
+    ``sync_team_skills`` to install them locally).
+
+    The emptiness check looks ONLY at ``viking://resources/skills/`` — it
+    deliberately ignores SkillClaw's evolution space
+    (``viking://resources/skillclaw/<group>/skills/``), so a server that has
+    only ever run SkillClaw still gets seeded with the bundled base skills.
 
     No-op (returns 0) unless OPENVIKING_ENDPOINT is set, a client can be
-    built, AND the server reports zero team skills. Never raises.
+    built, AND the publish space is empty. Never raises.
 
     Returns the number of skills published.
     """
@@ -1299,37 +1337,50 @@ def bootstrap_team_skills_if_empty(quiet: bool = True) -> int:
         return 0
     try:
         from tools.skills_sync import _get_bundled_dir, _discover_bundled_skills
-        from tools.skills_hub_openviking_source import OpenVikingSkillSource
+        from tools.skills_hub_openviking_source import (
+            OpenVikingSkillSource,
+            _VIKING_SKILL_PREFIX,
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("Skill bootstrap unavailable: %s", exc)
         return 0
 
-    try:
-        source = OpenVikingSkillSource()
-    except Exception as exc:
-        logger.debug("Skill bootstrap: could not build source: %s", exc)
-        return 0
-    if source._client is None:
+    client = OpenVikingSkillSource._build_client()
+    if client is None:
         return 0
 
-    # Only seed when the team space is genuinely empty — never clobber an
-    # already-populated server.
+    # Only seed when the team PUBLISH prefix is empty — never clobber an
+    # already-populated publish space, and ignore the SkillClaw evolution
+    # space so a SkillClaw-only server still gets the bundled base set.
     try:
-        if source.search("", limit=1):
+        resp = client.get("/api/v1/fs/ls",
+                          params={"uri": _VIKING_SKILL_PREFIX})
+        result = resp.get("result")
+        if isinstance(result, dict):
+            entries = (result.get("entries") or result.get("items")
+                       or result.get("children") or [])
+        elif isinstance(result, list):
+            entries = result
+        else:
+            entries = []
+        if entries:
             return 0
     except Exception as exc:
-        logger.debug("Skill bootstrap: emptiness check failed: %s", exc)
-        return 0
+        # NOT_FOUND means the publish prefix doesn't exist yet -> empty ->
+        # proceed to seed. Any other error: bail out to be safe.
+        if "NOT_FOUND" not in str(exc) and "not found" not in str(exc).lower():
+            logger.debug("Skill bootstrap: emptiness check failed: %s", exc)
+            return 0
 
     bundled = _discover_bundled_skills(_get_bundled_dir())
     if not bundled:
         return 0
 
     if not quiet:
-        logger.info("No team skills on server — seeding %d bundled skill(s).",
+        logger.info("Publish space empty — seeding %d bundled skill(s).",
                     len(bundled))
     published, _skipped, _failed = _publish_bundled_skills(
-        source._client, bundled, force=False,
+        client, bundled, force=False,
     )
     return published
 
