@@ -538,6 +538,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._shared_client: Optional[_VikingClient] = None
         self._team_user = "__team__"
         self._feedback_tracking = False
+        # by-peer isolation: when OPENVIKING_PEER_ID is set, the active user's
+        # OWN space (self memory) is the shared team space, and the stable
+        # interaction partner (peer_id) gets a private sub-namespace under
+        # viking://user/{user}/peers/{peer_id}/.  Empty => legacy team_user mode.
+        self._peer_id = ""
+        self._session_created = False
 
     @property
     def name(self) -> str:
@@ -586,6 +592,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "default": "__team__",
                 "env_var": "OPENVIKING_TEAM_USER",
             },
+            {
+                "key": "peer_id",
+                "description": (
+                    "Stable interaction-partner ID for by-peer isolation. When set, "
+                    "the active user's own space is the SHARED team space and this "
+                    "peer's private memory lives under viking://user/{user}/peers/{peer_id}/. "
+                    "Leave blank to use the legacy team_user shared space."
+                ),
+                "env_var": "OPENVIKING_PEER_ID",
+            },
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -596,6 +612,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._agent = os.environ.get("OPENVIKING_AGENT", "hermes")
         self._session_id = session_id
         self._turn_count = 0
+        self._session_created = False
+
+        # by-peer isolation mode (see __init__): a non-empty OPENVIKING_PEER_ID
+        # flips the model so the active user's own space IS the shared team
+        # space, and the peer gets a private sub-namespace. Normalize away path
+        # separators so it can never escape the peers/ subtree.
+        raw_peer = os.environ.get("OPENVIKING_PEER_ID", "") or ""
+        self._peer_id = raw_peer.strip().replace("/", "_").replace("\\", "_")
 
         try:
             self._client = _VikingClient(
@@ -609,23 +633,60 @@ class OpenVikingMemoryProvider(MemoryProvider):
             logger.warning("httpx not installed — OpenViking plugin disabled")
             self._client = None
 
-        # Shared client for team L2/L3 knowledge
-        self._team_user = os.environ.get("OPENVIKING_TEAM_USER", "__team__")
         self._feedback_tracking = os.environ.get("OPENVIKING_FEEDBACK_TRACKING", "").lower() in ("1", "true", "yes")
-        try:
-            self._shared_client = _VikingClient(
-                self._endpoint, self._api_key,
-                account=self._account, user=self._team_user, agent=self._agent,
-            )
-            if not self._shared_client.health():
-                logger.warning("OpenViking shared client at %s is not reachable", self._endpoint)
+
+        if self._peer_id:
+            # In by-peer mode the team space is the active user's OWN self
+            # memory, so the "shared" client is just the same user. We do NOT
+            # spin up a separate __team__ user — self == team.
+            self._team_user = self._user
+            self._shared_client = self._client
+            # Peer memory only gets extracted on commit when the session was
+            # created with an explicit peer-enabled memory_policy (server
+            # default is peer.enabled=False). Create it up-front.
+            self._ensure_session_with_peer_policy()
+        else:
+            # Legacy mode: dedicated team_user shared space.
+            self._team_user = os.environ.get("OPENVIKING_TEAM_USER", "__team__")
+            try:
+                self._shared_client = _VikingClient(
+                    self._endpoint, self._api_key,
+                    account=self._account, user=self._team_user, agent=self._agent,
+                )
+                if not self._shared_client.health():
+                    logger.warning("OpenViking shared client at %s is not reachable", self._endpoint)
+                    self._shared_client = None
+            except Exception:
                 self._shared_client = None
-        except Exception:
-            self._shared_client = None
 
         # Register as the last active provider for atexit safety net
         global _last_active_provider
         _last_active_provider = self
+
+    def _ensure_session_with_peer_policy(self) -> None:
+        """Create the session with a peer-enabled memory_policy (by-peer mode).
+
+        OpenViking only extracts peer memory on commit when the session's
+        memory_policy has ``peer.enabled=true`` (the server default is False,
+        which would silently drop every peer-scoped memory). The plugin
+        normally relies on auto-create via the first add_message, which uses
+        the default policy — so we must explicitly create the session here.
+        """
+        if not self._client or self._session_created:
+            return
+        try:
+            self._client.post("/api/v1/sessions", {
+                "session_id": self._session_id,
+                "memory_policy": {
+                    "self": {"enabled": True},
+                    "peer": {"enabled": True},
+                },
+            })
+            self._session_created = True
+        except Exception as e:
+            # The session may already exist (idempotent re-init) — that is fine.
+            logger.debug("OpenViking peer session create skipped: %s", e)
+            self._session_created = True
 
     def _user_needs_onboarding(self) -> bool:
         """Return True when the active user has no personal profile yet.
@@ -779,13 +840,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 # target_uri this would surface other teammates' private
                 # memories as "your" context.  Merge hits, best score wins.
                 merged: Dict[str, Dict[str, dict]] = {}
-                for target_uri in self._scoped_target_uris("all"):
+                for target_uri, peer_id in self._scoped_targets("all"):
+                    payload = {
+                        "query": query,
+                        "top_k": 5,
+                        "target_uri": target_uri,
+                    }
+                    if peer_id:
+                        payload["peer_id"] = peer_id
                     try:
-                        resp = client.post("/api/v1/search/find", {
-                            "query": query,
-                            "top_k": 5,
-                            "target_uri": target_uri,
-                        })
+                        resp = client.post("/api/v1/search/find", payload)
                     except Exception as exc:
                         logger.debug("OpenViking prefetch failed for %s: %s", target_uri, exc)
                         continue
@@ -860,16 +924,26 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 )
                 sid = self._session_id
 
-                # Add user message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
+                # In by-peer mode every message carries the peer_id so commit
+                # extracts this turn's memories into the peer's private subtree
+                # (viking://user/{user}/peers/{peer_id}/...) instead of the
+                # shared self space. Empty peer_id => self memory (legacy).
+                user_msg: Dict[str, Any] = {
                     "role": "user",
                     "content": user_content[:4000],  # trim very long messages
-                })
-                # Add assistant message
-                client.post(f"/api/v1/sessions/{sid}/messages", {
+                }
+                assistant_msg: Dict[str, Any] = {
                     "role": "assistant",
                     "content": assistant_content[:4000],
-                })
+                }
+                if self._peer_id:
+                    user_msg["peer_id"] = self._peer_id
+                    assistant_msg["peer_id"] = self._peer_id
+
+                # Add user message
+                client.post(f"/api/v1/sessions/{sid}/messages", user_msg)
+                # Add assistant message
+                client.post(f"/api/v1/sessions/{sid}/messages", assistant_msg)
             except Exception as e:
                 logger.debug("OpenViking sync_turn failed: %s", e)
 
@@ -906,8 +980,11 @@ class OpenVikingMemoryProvider(MemoryProvider):
         except Exception as e:
             logger.warning("OpenViking session commit failed: %s", e)
 
-        # Commit shared session (if shared client exists)
-        if self._shared_client:
+        # Commit shared session (legacy team_user mode only). In by-peer mode
+        # the shared client IS the active user's own client, so there is no
+        # separate _shared session to commit — self memory was already
+        # extracted by the main commit above.
+        if self._shared_client and not self._peer_id:
             try:
                 shared_session_id = f"{self._session_id}_shared"
                 self._shared_client.post(f"/api/v1/sessions/{shared_session_id}/commit")
@@ -917,9 +994,20 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
     def _build_memory_uri(self, subdir: str, scope: str = "private") -> str:
         """Build a viking:// memory URI under the appropriate user/subdir.
-        scope: "private" uses personal user, "shared" uses team user.
+        scope: "private" uses personal space, "shared" uses team space.
+
+        by-peer mode: "private" writes to the peer subtree
+        viking://user/{user}/peers/{peer_id}/memories/..., "shared" writes to
+        the user's OWN self memory (which is the shared team space).
+        Legacy mode: "shared" uses team_user, "private" uses the user.
         """
         slug = uuid.uuid4().hex[:12]
+        if self._peer_id:
+            if scope == "shared":
+                base = f"viking://user/{self._user}/memories"
+            else:
+                base = f"viking://user/{self._user}/peers/{self._peer_id}/memories"
+            return f"{base}/{subdir}/mem_{slug}.md"
         user = self._team_user if scope == "shared" else self._user
         return f"viking://user/{user}/memories/{subdir}/mem_{slug}.md"
 
@@ -1076,8 +1164,13 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 return False
         return None
 
-    def _scoped_target_uris(self, scope: str) -> List[str]:
-        """Return the viking:// namespaces a search may touch for ``scope``.
+    def _scoped_targets(self, scope: str) -> List[tuple]:
+        """Return ``(target_uri, peer_id)`` pairs a search may touch for ``scope``.
+
+        ``peer_id`` is non-empty only for the self-memory target in by-peer
+        mode, where ``find``'s peer_id parameter makes the server return the
+        active user's own (team) memory PLUS this peer's private memory in a
+        single call — exactly the "shared + isolated" view we want.
 
         With a ROOT API key, OpenViking's /search/find ignores the
         X-OpenViking-User header and ranks across *every* user's private
@@ -1091,27 +1184,41 @@ class OpenVikingMemoryProvider(MemoryProvider):
         re-introduce the very cross-user leak we are guarding against.  Only
         the evolved skills — sanitised, reusable knowledge — are shareable.
         """
-        user_uri = f"viking://user/{self._user}/"
-        team_uri = f"viking://user/{self._team_user}/"
         # Shared skill trees only — NOT raw session logs (see docstring).
         # Skills are published & versioned by SkillClaw's evolution pipeline
         # under resources/<root_prefix>/<group_id>/skills/, mirroring
         # SKILLCLAW_VIKING_ROOT_PREFIX / SKILLCLAW_VIKING_GROUP_IDS so
         # non-"team-a" deployments still work.
-        shared_resources: List[str] = []
+        shared_resources: List[tuple] = []
         root_prefix = os.environ.get("SKILLCLAW_VIKING_ROOT_PREFIX", "skillclaw").strip("/")
         group_ids = os.environ.get("SKILLCLAW_VIKING_GROUP_IDS", "").strip()
         for gid in (g.strip() for g in group_ids.split(",")):
             if gid:
                 shared_resources.append(
-                    f"viking://resources/{root_prefix}/{gid}/skills/"
+                    (f"viking://resources/{root_prefix}/{gid}/skills/", "")
                 )
+
+        if self._peer_id:
+            # by-peer mode: self memory == team space; peer subtree == private.
+            self_mem = f"viking://user/{self._user}/memories"
+            peer_mem = f"viking://user/{self._user}/peers/{self._peer_id}/memories"
+            if scope == "private":
+                # Peer's own private memory only.
+                return [(peer_mem, "")] + shared_resources
+            if scope == "shared":
+                # Team (self) memory only.
+                return [(self_mem, "")] + shared_resources
+            # "all": one call covering self + peer via the peer_id parameter.
+            return [(self_mem, self._peer_id)] + shared_resources
+
+        user_uri = f"viking://user/{self._user}/"
+        team_uri = f"viking://user/{self._team_user}/"
         if scope == "private":
-            return [user_uri] + shared_resources
+            return [(user_uri, "")] + shared_resources
         if scope == "shared":
-            return [team_uri] + shared_resources
+            return [(team_uri, "")] + shared_resources
         # "all" (default): personal + team + shared skills
-        return [user_uri, team_uri] + shared_resources
+        return [(user_uri, ""), (team_uri, "")] + shared_resources
 
     def _tool_search(self, args: dict) -> str:
         query = args.get("query", "")
@@ -1125,9 +1232,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # all/private/shared expand to the namespace allow-list instead.
         raw_scope = str(args.get("scope") or "").strip()
         if raw_scope.startswith("viking://"):
-            target_uris = [raw_scope]
+            targets = [(raw_scope, "")]
         else:
-            target_uris = self._scoped_target_uris(scope if scope in ("all", "private", "shared") else "all")
+            targets = self._scoped_targets(scope if scope in ("all", "private", "shared") else "all")
 
         mode = args.get("mode", "auto")
         top_k = args.get("limit")
@@ -1136,8 +1243,10 @@ class OpenVikingMemoryProvider(MemoryProvider):
         # unscoped query would leak other users' private memories under a
         # ROOT key.  De-duplicate merged hits by URI, keeping the best score.
         merged: Dict[str, Dict[str, list]] = {}
-        for target_uri in target_uris:
+        for target_uri, peer_id in targets:
             payload: Dict[str, Any] = {"query": query, "target_uri": target_uri}
+            if peer_id:
+                payload["peer_id"] = peer_id
             if mode != "auto":
                 payload["mode"] = mode
             if top_k:
@@ -1197,7 +1306,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         scored_entries.sort(key=lambda x: x[0], reverse=True)
         # Scope is already enforced at query time via per-namespace
-        # target_uri (see _scoped_target_uris), so no post-filtering is
+        # target_uri (see _scoped_targets), so no post-filtering is
         # needed here.
         # Filter out archived entries (redirect markers), deprioritize low-priority entries
         active_entries = []

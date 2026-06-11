@@ -863,8 +863,12 @@ def init_agent(
         # providers (OpenAI, Anthropic, etc.).
         _sc_key = str(client_kwargs.get("api_key", "") or "")
         if _sc_key.startswith("skillclaw"):
+            # by-peer 模式下多个 mock 用户共用一个 OPENVIKING_USER（团队 agent），
+            # 用 OPENVIKING_PEER_ID 区分每个真实终端用户，让 SkillClaw 按 mock 用户
+            # 而非团队 agent 归属录制的 session。peer 为空时回退到 user 身份。
             _sc_user = (
-                os.environ.get("OPENVIKING_USER")
+                os.environ.get("OPENVIKING_PEER_ID")
+                or os.environ.get("OPENVIKING_USER")
                 or os.environ.get("SKILLCLAW_USER")
                 or os.environ.get("USER")
                 or ""
